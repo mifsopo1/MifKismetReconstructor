@@ -1,0 +1,23 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "Mif Kismet Reconstructor",
+	"Description": "Reconstructs editable K2 Blueprint graphs from cooked Kismet bytecode (Phase 0: in-editor disassembler + JSON dumper).",
+	"Category": "Editor",
+	"CreatedBy": "Mif",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "MifKismetReconstructor",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	]
+}
