@@ -1,0 +1,52 @@
+MifKismetReconstructor — attribution and license notice
+=========================================================
+
+MifKismetReconstructor is licensed under the GNU General Public License,
+version 3 (GPL-3.0). See the LICENSE file for the full text.
+
+This license is required because this plugin incorporates and adapts source
+code from the following GPL-3.0 projects:
+
+  * UEAssetToolkit
+    Copyright (c) Archengius and contributors
+    https://github.com/Archengius/UEAssetToolkit
+
+  * UEAssetToolkit-Fixes
+    Copyright (c) Buckminsterfullerene02 / AstroTechies and contributors
+    https://github.com/Buckminsterfullerene02/UEAssetToolkit-Fixes
+
+Both upstream projects are licensed under GPL-3.0. Because this plugin is a
+derivative work of them, it is distributed under the same license.
+
+Files in this repository that are derived from the above projects:
+
+  Source/MifKismetReconstructor/Private/Toolkit/PropertyTypeHelper.cpp
+  Source/MifKismetReconstructor/Public/Toolkit/PropertyTypeHelper.h
+      Adapted from UEAssetToolkit-Fixes (AssetDumper) — FProperty <-> FEdGraphPinType <-> JSON.
+
+  Source/MifKismetReconstructor/Private/Toolkit/KismetBytecodeDisassemblerJson.cpp
+  Source/MifKismetReconstructor/Public/Toolkit/KismetBytecodeDisassemblerJson.h
+      Adapted from UEAssetToolkit-Fixes (AssetDumper) — Kismet bytecode -> JSON statement stream.
+
+  Source/MifKismetReconstructor/Private/AssetGeneration/KismetIntermediateFormat.h
+      Adapted from UEAssetToolkit-Fixes (AssetGenerator) — the compiler-mirrored
+      intermediate representation.
+
+Modifications made by Mifsopo ("Mif"), 2026:
+
+  * Ported the above from Unreal Engine 4.25–4.27 to Unreal Engine 5.3.2.
+  * Hardened the disassembler for in-editor use against cooked BlueprintGeneratedClasses
+    (per-opcode failure tracking, opcode histogram, safe abort on unknown opcodes).
+  * Implemented value-semantic operator== / GetTypeHash on the intermediate terminal type
+    (upstream left these as stubs) to key producer->reader dataflow maps.
+  * Added the transformer (KismetBytecodeTransformer), graph decompiler
+    (KismetGraphDecompiler*), ubergraph analysis/slicing, event-body reconstruction,
+    and fidelity verification, which are original work built on top of the ported base.
+
+NOTE ON THE UNREAL ENGINE
+
+This plugin is editor-only and links against Unreal Engine headers/modules at build
+time. The Unreal Engine is governed by the Epic Games Unreal Engine EULA. This
+repository contains ONLY plugin source code — it does not contain, and must not be
+used to redistribute, any Unreal Engine source code. Build it against your own
+licensed copy of the required engine (see README).
