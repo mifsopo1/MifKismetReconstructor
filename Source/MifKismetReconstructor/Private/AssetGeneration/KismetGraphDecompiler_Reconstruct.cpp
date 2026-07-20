@@ -1762,6 +1762,22 @@ UK2Node_VariableGet* FKismetGraphDecompiler::GetOrCreateVariableGetter(TSharedPt
 	}
 	if (!VarSource) return nullptr;
 	const FName VarName(*T->AssociatedVarProperty);
+
+	// A property the cooked bytecode reads but a Blueprint graph CANNOT (no CPF_BlueprintVisible) — most commonly a
+	// Timeline's generated progress/direction float (`<Timeline>_<Track>_<GUID>`) or another compiler-generated internal
+	// var. A getter for it errors "X is not blueprint visible (BlueprintReadOnly or BlueprintReadWrite)". Degrade: emit
+	// nothing, leave the consumer at its default — a clean PARTIAL instead of a hard FAIL. (Full UK2Node_Timeline
+	// reconstruction is the future lever that would recover the value properly.)
+	if (const FProperty* VisProp = VarSource->FindPropertyByName(VarName))
+	{
+		if (!VisProp->HasAnyPropertyFlags(CPF_BlueprintVisible))
+		{
+			EmitFailureComment(FString::Printf(
+				TEXT("variable '%s' is not blueprint-visible (timeline/generated internal) - deferred"), *VarName.ToString()));
+			bDegraded = true;
+			return nullptr;
+		}
+	}
 #if MIF_KR_DEBUG
 	UE_LOG(LogMifKismetReconstructor, Warning, TEXT("[getter] var='%s' vt=%d source='%s' onSource=%d"),
 		*VarName.ToString(), (int32) T->VarType, *VarSource->GetName(), VarSource->FindPropertyByName(VarName) ? 1 : 0);
@@ -1785,14 +1801,30 @@ UK2Node_VariableGet* FKismetGraphDecompiler::GetOrCreateVariableGetter(TSharedPt
 			// drop it from the cache, mark the body PARTIAL. The CONSUMER data pin is then left at its default (which
 			// COMPILES) rather than the whole Blueprint failing. This is the doctrine — degrade, never break — and it is
 			// what lets object-typed temps be aliased safely (an unwireable one degrades here instead of failing).
-			if (SelfIn->LinkedTo.Num() == 0)
+			// A member getter with an unconnected REQUIRED Target is a hard FAIL — AND so is one wired to an
+			// INCOMPATIBLE producer: a class-context instance read wires a PC_Class producer into the PC_Object Target
+			// ("'X' is an object type, and 'Target' is a reference to an object instance"). Both degrade the same way.
+			UEdGraphPin* BadProducer = nullptr;
+			const bool bUnwired = (SelfIn->LinkedTo.Num() == 0);
+			if (!bUnwired)
 			{
+				const UEdGraphSchema_K2* K2 = GetDefault<UEdGraphSchema_K2>();
+				UEdGraphPin* Producer = SelfIn->LinkedTo[0];
+				if (Producer && !K2->ArePinTypesCompatible(Producer->PinType, SelfIn->PinType))
+				{
+					BadProducer = Producer;
+				}
+			}
+			if (bUnwired || BadProducer)
+			{
+				if (BadProducer) { SelfIn->BreakAllPinLinks(); }
 				VariableGetterCache.Remove(Key);
 				G->DestroyNode();
 				if (NodesCreated > 0) { --NodesCreated; }
 				EmitFailureComment(FString::Printf(
-					TEXT("getter '%s': non-self context could not be wired → Target would be unconnected (deferred)"),
-					*VarName.ToString()));
+					TEXT("getter '%s': %s (deferred)"), *VarName.ToString(),
+					bUnwired ? TEXT("non-self context could not be wired -> Target unconnected")
+					         : TEXT("context pin type incompatible with Target (e.g. class-context instance read)")));
 				bDegraded = true;
 				return nullptr;
 			}

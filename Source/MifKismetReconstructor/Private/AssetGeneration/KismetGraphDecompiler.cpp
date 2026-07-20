@@ -641,6 +641,12 @@ UEdGraphNode* FKismetGraphDecompiler::CreateVariableSetNode() {
             // objects nets +15 hard FAILs for +1.4% rate. Object + reused temps stay degraded — the structural floor
             // (reused needs dominance-based SSA; naive member-var promotion is prohibitive: AddMemberVariable forces a
             // synchronous skeleton recompile PER temp, dozens per event).
+            // Restrict the alias to VALUE-typed single-assignment temps. MEASURED 2026-07-19 on the full 1256-BP corpus:
+            // enabling the OBJECT family (dropping `!bObjectFamily`) regressed the batch FAIL 122→158 (+36), because an
+            // aliased object-temp used as a member-access CONTEXT leaves a CALL/SETTER Target pin unwired ("self is not a
+            // <Class>; Target must have a connection"). The exec-bound-node degrade that would salvage it (disabling the
+            // node so exec passes through) ASSERTS in BlueprintEditorUtils.cpp:1932 when done mid-reconstruction — so the
+            // object family stays deferred until a compile-safe Target-degrade exists. Object + reused temps stay degraded.
             const FName TCat0 = LeftHandOperand->Type.PinCategory;
             const bool bObjectFamily = (TCat0 == UEdGraphSchema_K2::PC_Object || TCat0 == UEdGraphSchema_K2::PC_Interface
                 || TCat0 == UEdGraphSchema_K2::PC_Class || TCat0 == UEdGraphSchema_K2::PC_SoftObject || TCat0 == UEdGraphSchema_K2::PC_SoftClass);
@@ -682,6 +688,14 @@ UEdGraphNode* FKismetGraphDecompiler::CreateVariableSetNode() {
     if (!ContextTypeStruct || !ContextTypeStruct->FindPropertyByName(*AccessedPropertyName)) {
         EmitFailureComment(FString::Printf(TEXT("variable-set target '%s' unresolved (deferred)"), *AccessedPropertyName));
         return NULL;
+    }
+    // Mirror of the getter guard (GetOrCreateVariableGetter): a SET to a property a Blueprint graph cannot write —
+    // not blueprint-visible, or BlueprintReadOnly — is a hard compile FAIL (timeline/generated internals). Degrade.
+    if (const FProperty* SetVisProp = ContextTypeStruct->FindPropertyByName(*AccessedPropertyName)) {
+        if (!SetVisProp->HasAnyPropertyFlags(CPF_BlueprintVisible) || SetVisProp->HasAnyPropertyFlags(CPF_BlueprintReadOnly)) {
+            EmitFailureComment(FString::Printf(TEXT("variable-set target '%s' is not blueprint-writable (timeline/generated/read-only internal) - deferred"), *AccessedPropertyName));
+            return NULL;
+        }
     }
     
     //Allocate node and try to resolve referenced member at the start
@@ -990,7 +1004,16 @@ UEdGraphNode* FKismetGraphDecompiler::CreateFunctionCallNode() {
             this->NodeExecPinInputMap.Add(Stmt, ExecIn);
         }
         if (UEdGraphPin* ThenPin = Node->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output)) {
-            const TSharedPtr<FKismetCompiledStatement> Successor = PeekNextValidStatement(0);
+            // A latent call (Delay/timeline) carries its resume continuation ("Completed") in TargetLabel — the
+            // transformer's LatentActionInfo.Linkage patch-up (KismetBytecodeTransformer.cpp) resolved to the
+            // resume statement in FinishGeneration. That target is NOT the adjacent slice statement when the
+            // resume lands on a join / loop re-entry (e.g. CarSpawner's spawn block re-entered by the Delay(2)
+            // loop-back), so wiring the Then pin by fall-through adjacency silently DROPS the resume edge.
+            // Prefer the recorded resume target; fall back to fall-through only for ordinary calls, where
+            // TargetLabel is NULL (line 99: TargetLabel is only set for a latent-resume KCST_CallFunction here,
+            // since bIsCallIntoUbergraph is already short-circuited at the top of this function).
+            const TSharedPtr<FKismetCompiledStatement> Successor =
+                Stmt->TargetLabel.IsValid() ? Stmt->TargetLabel : PeekNextValidStatement(0);
             if (Successor.IsValid()) this->ExecPinPatchUpMap.Add(ThenPin, Successor);
         }
     }
