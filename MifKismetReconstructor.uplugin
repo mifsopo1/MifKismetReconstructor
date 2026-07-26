@@ -19,5 +19,12 @@
 				"Win64"
 			]
 		}
+	],
+	"Plugins": [
+		{
+			"Name": "MifBridge",
+			"Enabled": true,
+			"Optional": true
+		}
 	]
 }

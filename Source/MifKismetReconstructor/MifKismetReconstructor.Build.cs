@@ -25,5 +25,23 @@ public class MifKismetReconstructor : ModuleRules
 			"UnrealEd",       // FBlueprintEditorUtils / FKismetEditorUtilities (decompiler, Phase 3)
 			"Kismet"          // CompiledBlueprintReconstructor.h — bind the F3 "Make Uncooked Blueprint Copy" hook (Phase 4)
 		});
+
+		// MifBridge (OPTIONAL). All kr_* HTTP endpoints live in THIS module (coupling model (b),
+		// docs/audit/work/K2_reconstructor_pipeline.md §B): the handlers sit next to the Private code
+		// they call, so not one reconstructor symbol needs exporting. The dep is guarded so this
+		// plugin still builds when MifBridge is not installed — the reconstructor's own value (F3
+		// hook, verifier, console tools) does not depend on the bridge.
+		// WITH_MIFBRIDGE is ALWAYS defined (1 or 0), never left undefined, so the sources can use a
+		// plain #if without an #ifndef guard.
+		string MifBridgeModuleDir = System.IO.Path.Combine(PluginDirectory, "..", "MifBridge", "Source", "MifBridge");
+		if (System.IO.Directory.Exists(MifBridgeModuleDir))
+		{
+			PrivateDependencyModuleNames.Add("MifBridge");
+			PrivateDefinitions.Add("WITH_MIFBRIDGE=1");
+		}
+		else
+		{
+			PrivateDefinitions.Add("WITH_MIFBRIDGE=0");
+		}
 	}
 }
