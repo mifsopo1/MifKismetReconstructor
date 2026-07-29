@@ -10,8 +10,14 @@
 //   kr_pin_type_from_property  ReadOnly     FProperty -> FEdGraphPinType -> bridge type-grammar string
 //   kr_reconstruct_request     SelfManaged  start the ONE job slot (deferred one tick)
 //   kr_reconstruct_status      ReadOnly     poll it
-// Wave 3 (kr_verify_fidelity, kr_classify_drift, kr_drift_census, kr_batch_reconstruct) is blocked on
-// an engine-side KISMET_API refactor and is deliberately absent rather than stubbed.
+// Wave 3, complete (4 endpoints, ONE engine export — RunTransientBlueprintReconstruct, declared in
+// CompiledBlueprintReconstructor.h; nothing else in the reconstructor was promoted):
+//   kr_verify_fidelity         SelfManaged  throwaway transient CHILD + per-function bytecode diff
+//   kr_classify_drift          SelfManaged  the same run, decomposed into per-function verdicts
+//   kr_drift_census            SelfManaged  the same run over a filtered corpus, ONE BP PER TICK
+//   kr_batch_reconstruct       SelfManaged  pass/fail sweep (sibling by default), ONE BP PER TICK
+// All four run through the one-slot job model and are polled by kr_reconstruct_status. See the
+// WAVE 3 block below for the design; the export's own header carries the lifetime contract.
 //
 // Coupling model (b) (docs/audit/work/K2_reconstructor_pipeline.md §B, ratified in K_IMPL_PLAN.md
 // §0.2): the handlers live HERE, in the PROVIDER module, next to the Private code they call, so not
@@ -77,9 +83,14 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "HAL/FileManager.h"             // IFileManager — the sweep CSV writer and the census-file scan
+#include "HAL/IConsoleManager.h"         // IConsoleVariable — scoped mif.kr.* overrides (Wave 3)
 #include "Logging/TokenizedMessage.h"    // FTokenizedMessage::ToText for compile messages
+#include "Misc/FileHelper.h"             // FFileHelper::LoadFileToString — drift-census CSV row count
 #include "Misc/PackageName.h"            // DoesPackageExist — target-path uniquification
+#include "Misc/Paths.h"                  // FPaths::ProjectSavedDir — <ProjectSaved>/MifKr report folder
 #include "Modules/ModuleManager.h"
+#include "Serialization/Archive.h"       // FArchive::Serialize/Flush — per-row-flushed sweep CSV
 #include "TimerManager.h"                // SetTimerForNextTick
 #include "UObject/Class.h"
 #include "UObject/UnrealType.h"          // FProperty::GetCPPType, TFieldIterator<FProperty>
@@ -117,6 +128,17 @@ namespace MifKr::BridgeEndpoints
 		TArray<FString> Unrecognised;
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : In->Values)
 		{
+			// 'op' is the BATCH DISPATCHER's routing key, not a handler parameter: H_batch passes each op
+			// object to the handler VERBATIM, 'op' field included. MifBridge tolerates it centrally in
+			// its own RejectUnknownParams so no call site has to remember it; this mirror must do the
+			// same or every ReadOnly kr_* endpoint fails with "unrecognised parameter 'op'" the moment it
+			// is called inside batch — strictness silently breaking composition, the exact regression
+			// MifBridge already had and fixed (06_IMPLEMENTED.md, "Batch E + `op` regression").
+			if (Pair.Key.Equals(TEXT("op"), ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+
 			bool bKnown = false;
 			for (const TCHAR* Key : AcceptedKeys)
 			{
@@ -161,6 +183,19 @@ namespace MifKr::BridgeEndpoints
 	{
 		bool Value = Default;
 		return In->TryGetBoolField(Field, Value) ? Value : Default;
+	}
+
+	/** First PRESENT of several accepted spellings, for BOOL params with aliases
+	 *  (classifyIntentional/classify). "First present", not "first true": a caller who passes
+	 *  classify:false must get false, and a value-based fold would silently return the default. */
+	static bool KrJBoolAny(const TSharedRef<FJsonObject>& In, std::initializer_list<const TCHAR*> Fields, bool Default)
+	{
+		for (const TCHAR* Field : Fields)
+		{
+			bool Value = Default;
+			if (In->TryGetBoolField(Field, Value)) { return Value; }
+		}
+		return Default;
 	}
 
 	static int32 KrJInt(const TSharedRef<FJsonObject>& In, const TCHAR* Field, int32 Default)
@@ -2298,9 +2333,11 @@ namespace MifKr::BridgeEndpoints
 		// The honesty field. Present on EVERY response, including found:false — the constraint it
 		// describes is a property of the HTTP server, not of any particular job.
 		const TCHAR* HonestyNote =
-			TEXT("single-Blueprint jobs are ATOMIC: the HTTP listener is a game-thread ticker, so while the job runs no ")
-			TEXT("request is read off the socket at all - progress counters therefore advance on completion, never mid-job. ")
-			TEXT("Job records are in-memory only: after an editor restart this answers found:false. ")
+			TEXT("single-Blueprint jobs (reconstruct, verify, classify) are ATOMIC: the HTTP listener is a game-thread ")
+			TEXT("ticker, so while the job runs no request is read off the socket at all - their progress counters advance ")
+			TEXT("on completion, never mid-job. The SLICED kinds (census, batch) are the exception and the reason: they ")
+			TEXT("process ONE Blueprint per tick, so the ticker pumps HTTP between Blueprints and result.bpDone genuinely ")
+			TEXT("advances across polls. Job records are in-memory only: after an editor restart this answers found:false. ")
 			TEXT("Exactly one record is retained, so poll after done works but is lost once the next request is accepted.");
 
 		if (!MifKr::Jobs::HasRecord())
@@ -2327,6 +2364,11 @@ namespace MifKr::BridgeEndpoints
 		Out->SetBoolField(TEXT("found"), true);
 		Out->SetStringField(TEXT("jobId"), Job.JobId);
 		Out->SetStringField(TEXT("kind"), Job.Kind);
+		// Whether a mid-job poll of THIS kind can observe progress at all. Stated per record rather than
+		// left to the general note: polling an atomic kind in a loop is not wrong, but the caller must
+		// know the counters CANNOT move until the job ends, so an unchanged poll is not a hung job.
+		Out->SetBoolField(TEXT("progressObservable"),
+			Job.Kind == TEXT("census") || Job.Kind == TEXT("batch"));
 		Out->SetStringField(TEXT("state"), MifKr::Jobs::StateName(Job.State));
 		Out->SetStringField(TEXT("phase"), Job.Phase);
 		Out->SetStringField(TEXT("mode"), Job.Mode);
@@ -2363,6 +2405,1678 @@ namespace MifKr::BridgeEndpoints
 		if (Job.Result.IsValid()) { Out->SetObjectField(TEXT("result"), Job.Result); }
 		if (!Job.Error.IsEmpty())  { Out->SetStringField(TEXT("error"), Job.Error); }
 		Out->SetStringField(TEXT("note"), HonestyNote);
+	}
+
+	// ============================== WAVE 3 — THE VERIFY FAMILY ======================================
+	//
+	// kr_verify_fidelity, kr_classify_drift, kr_drift_census, kr_batch_reconstruct.
+	//
+	// ALL FOUR ARE ONE ENGINE CALL. RunTransientBlueprintReconstruct (CompiledBlueprintReconstructor.h,
+	// KISMET_API) mints a copy of the cooked class into GetTransientPackage(), runs the SAME
+	// PopulateUncookedCopy pipeline F3 and mif.kr.ReconstructAll run, compiles it silently into an
+	// FCompilerResultsLog, hands the live UBlueprint to a callback, and then unroots it and marks it
+	// RF_Transient ITSELF. Nothing is saved, registered with the AssetRegistry, opened, or dialogged.
+	// The four endpoints differ only in what their callback does and how many Blueprints they feed it.
+	//
+	// THE POINTER RULE, and why it is the first thing in this block: the UBlueprint* handed to the
+	// callback is torn down the instant the callback returns, and OutStats.AttemptedFunctions holds raw
+	// UFunction* into the COOKED class that are only guaranteed live for the same window. Every callback
+	// below therefore copies out ints and FStrings ONLY. Retaining either pointer is a use-after-collect
+	// that a census would reproduce 1256 times.
+	//
+	// WHY NOT REUSE CreateEditableBlueprintCopy (the Wave-1 copy-mode call): it is a persistent asset
+	// factory — it calls AssetCreated + MarkPackageDirty + SavePackage unconditionally, and compiles
+	// with neither a results log nor bSilentMode. Over a census that is one .uasset write, one registry
+	// add and one delete per Blueprint, with compile errors unreportable. See the export's own header.
+	//
+	// SHIP SAFETY (the block at the top of this file, extended to engine statics): nothing here calls a
+	// MIF_KR_DEBUG-gated helper or a symbol with internal linkage in another TU. The engine's
+	// IsCompiledBlueprintAsset / ResolveBlueprintClass / RunReconstructOnce are all file-static inside
+	// namespace CompiledBlueprintCopyAction and are REIMPLEMENTED here, ungated, from public API.
+	//
+	// PROGRESS HONESTY. Single-BP jobs (verify, classify) are ATOMIC — the HTTP listener is a
+	// game-thread ticker, so nothing is read off the socket while they run. The census and batch sweeps
+	// are the exception and the reason the job model exists: they process ONE Blueprint per tick, so
+	// between Blueprints the ticker pumps HTTP and a poll genuinely observes progress. Both write their
+	// running totals into the job record's result payload on every slice, so kr_reconstruct_status shows
+	// live counters with no new status endpoint and no new record fields.
+
+	/** Scoped in-process override of an int CVar, restored on destruction. Used for
+	 *  mif.kr.ClassifyIntentional (MifDriftClassifier.cpp:57-62) and mif.kr.DriftCensus (:66-71).
+	 *  RAII rather than set-then-set-back at the end of the handler because a census spans MANY ticks
+	 *  and any early return in between would otherwise leave the editor permanently in census mode —
+	 *  a diagnostic CSV silently growing for the rest of the session. */
+	struct FKrScopedCVarInt
+	{
+		FKrScopedCVarInt(const TCHAR* Name, int32 NewValue)
+			: VarName(Name)
+		{
+			Var = IConsoleManager::Get().FindConsoleVariable(Name);
+			if (!Var) { return; }
+			Prev = Var->GetInt();
+			if (Prev == NewValue) { bApplied = true; return; }
+
+			// A CVar Set is REFUSED, silently and with no return value, when the caller's priority is
+			// below the one that last wrote it - and ECVF_SetByConsole (a human typing the CVar into the
+			// console) outranks ECVF_SetByCode. Without the read-back below, a caller who asked for
+			// classifyIntentional:false would get a run with it ON and no way to tell: exactly the
+			// silent-wrong-answer class this bridge refuses. So: try as code, verify, escalate to the
+			// console priority only if the polite attempt lost, and remember which one won so the restore
+			// uses the same priority (a restore at a lower priority would be refused too).
+			Var->Set(NewValue, ECVF_SetByCode);
+			if (Var->GetInt() != NewValue)
+			{
+				SetBy = ECVF_SetByConsole;
+				Var->Set(NewValue, SetBy);
+			}
+			bApplied = (Var->GetInt() == NewValue);
+			bChanged = bApplied;
+		}
+		~FKrScopedCVarInt()
+		{
+			if (Var && bChanged) { Var->Set(Prev, SetBy); bChanged = false; }
+		}
+		FKrScopedCVarInt(const FKrScopedCVarInt&) = delete;
+		FKrScopedCVarInt& operator=(const FKrScopedCVarInt&) = delete;
+
+		bool Found() const { return Var != nullptr; }
+		/** True iff the CVar actually reads back the requested value. False => the request did NOT take
+		 *  effect and the caller must be told, never left to assume. */
+		bool Applied() const { return Var != nullptr && bApplied; }
+
+		FString VarName;
+		IConsoleVariable* Var = nullptr;
+		int32 Prev = 0;
+		bool  bChanged = false;
+		bool  bApplied = false;
+		EConsoleVariableFlags SetBy = ECVF_SetByCode;
+	};
+
+	/** True for a UAnimBlueprintGeneratedClass (or any subclass of one).
+	 *
+	 *  THE ANIM TRAP, and why every verify-family endpoint has to know about it: the engine's
+	 *  GetBlueprintClassTypesForSource (CompiledBlueprintCopyAction.cpp:216-225) special-cases ONLY
+	 *  Widget Blueprints, so an anim source is minted as a PLAIN UBlueprint — which is not a
+	 *  UAnimBlueprint, has no AnimGraph, and never routes through the anim compiler. The copy therefore
+	 *  loses the entire state-machine/AnimGraph half of the asset and any fidelity number measured on it
+	 *  describes a degraded copy, not the decompiler. The engine's own enumeration gate
+	 *  (IsCompiledBlueprintAsset:102-119) excludes anim BPGCs by exact class-path equality for exactly
+	 *  this reason, so census and batch never see one; the single-BP endpoints have no such gate and
+	 *  must refuse (or be forced past this, loudly flagged) instead of returning a meaningless score.
+	 *
+	 *  Matched by walking the CLASS-OF chain by name rather than Cast<UAnimBlueprintGeneratedClass>:
+	 *  naming that type would add an AnimGraphRuntime/Engine-anim include for one predicate, the same
+	 *  no-new-dependency reasoning IsWidgetAsset above already applies. */
+	static bool KrIsAnimBlueprintClass(const UObject* Obj)
+	{
+		static const FName AnimBPGCName(TEXT("AnimBlueprintGeneratedClass"));
+		for (const UClass* C = Obj ? Obj->GetClass() : nullptr; C; C = C->GetSuperClass())
+		{
+			if (C->GetFName() == AnimBPGCName) { return true; }
+		}
+		return false;
+	}
+
+	/** Every FBlueprintFidelityReport field, verbatim, plus the three derived numbers.
+	 *
+	 *  score/adjustedScore are JSON **null** when HasScore() is false — never 1.0 and never the -1.0f
+	 *  NoScore sentinel. The report header (CompiledBlueprintReconstructor.h) is explicit that callers
+	 *  MUST branch: a Blueprint with zero comparable functions has NO fidelity, and 735 of 1250 corpus
+	 *  Blueprints are exactly that (all-event BPs). Emitting 1.000 for them is the flattering lie the
+	 *  whole metric exists to avoid. `compared` and `scored` ride alongside every percentage so a
+	 *  caller can always see the denominator. */
+	static TSharedRef<FJsonObject> KrFidelityJson(const FBlueprintFidelityReport& R)
+	{
+		TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+		J->SetNumberField(TEXT("compared"), R.Compared);
+		J->SetNumberField(TEXT("identical"), R.Identical);
+		J->SetNumberField(TEXT("equivalent"), R.Equivalent);
+		J->SetNumberField(TEXT("intentional"), R.Intentional);
+		J->SetNumberField(TEXT("drift"), R.Drift);
+		J->SetNumberField(TEXT("missing"), R.Missing);
+		J->SetNumberField(TEXT("uncomparable"), R.Uncomparable);
+		J->SetNumberField(TEXT("scored"), R.Scored());
+		if (R.HasScore())
+		{
+			J->SetNumberField(TEXT("score"), R.Score());
+			J->SetNumberField(TEXT("adjustedScore"), R.AdjustedScore());
+		}
+		else
+		{
+			J->SetField(TEXT("score"), MakeShared<FJsonValueNull>());
+			J->SetField(TEXT("adjustedScore"), MakeShared<FJsonValueNull>());
+			J->SetStringField(TEXT("scoreNote"),
+				TEXT("null, NOT 1.000: nothing was scored (an all-event Blueprint has no own-class function bytecode to diff). ")
+				TEXT("735 of 1250 corpus Blueprints are in this state - treating them as perfect would inflate every aggregate."));
+		}
+		if (!R.FirstDrift.IsEmpty())       { J->SetStringField(TEXT("firstDrift"), R.FirstDrift); }
+		if (!R.IntentTally.IsEmpty())      { J->SetStringField(TEXT("intentTally"), R.IntentTally); }
+		if (!R.FirstIntentional.IsEmpty()) { J->SetStringField(TEXT("firstIntentional"), R.FirstIntentional); }
+		return J;
+	}
+
+	/** One function's verdict, derived from a SINGLE-FUNCTION fidelity report (see KrRunTransientVerify). */
+	struct FKrFunctionVerdict
+	{
+		FString Name;
+		FString Verdict;            // identical | equivalent | intentional | drift | missing | uncomparable | not-scored
+		TArray<FString> Reasons;    // classifier claim reasons, from the report's IntentTally
+		FString Detail;             // the engine-formatted root/audit line, verbatim - never re-parsed
+	};
+
+	/** Map a one-element fidelity report onto a verdict. Exactly one counter can be non-zero, because
+	 *  VerifyBlueprint's loop forms exactly one verdict per function (MifFidelityVerifier.cpp:460-593);
+	 *  ALL-zero means the verifier skipped it (`Script.Num() == 0`), which is reported as its own
+	 *  verdict rather than omitted - a silently dropped row is indistinguishable from a function that
+	 *  was never attempted. */
+	static FKrFunctionVerdict KrVerdictFromSingle(const FString& FnName, const FBlueprintFidelityReport& R)
+	{
+		FKrFunctionVerdict V;
+		V.Name = FnName;
+		if      (R.Identical    > 0) { V.Verdict = TEXT("identical"); }
+		else if (R.Equivalent   > 0) { V.Verdict = TEXT("equivalent"); }
+		else if (R.Intentional  > 0) { V.Verdict = TEXT("intentional"); V.Detail = R.FirstIntentional; }
+		else if (R.Drift        > 0) { V.Verdict = TEXT("drift");        V.Detail = R.FirstDrift; }
+		else if (R.Missing      > 0) { V.Verdict = TEXT("missing");      V.Detail = R.FirstDrift; }
+		else if (R.Uncomparable > 0) { V.Verdict = TEXT("uncomparable");
+			V.Detail = TEXT("disassembly aborted, an <unresolved> pointer, or the pair resolved to the same UFunction - excluded from BOTH numerator and denominator on purpose"); }
+		else                         { V.Verdict = TEXT("not-scored");
+			V.Detail = TEXT("the verifier skipped this function: the cooked side has no bytecode (Script.Num()==0)"); }
+
+		// "flowstack=1;outparam=1" -> ["flowstack","outparam"]. Reading the reasons off the report's own
+		// tally rather than off FVerdict: FVerdict never crosses the verifier boundary (it is built and
+		// consumed inside MifFidelityVerifier.cpp), and widening that boundary is the lockstep hazard the
+		// codebase refuses on principle (CompiledBlueprintReconstructor.h's delegate-arity note).
+		TArray<FString> Pairs;
+		R.IntentTally.ParseIntoArray(Pairs, TEXT(";"), /*CullEmpty*/ true);
+		for (const FString& P : Pairs)
+		{
+			FString Key, Val;
+			if (P.Split(TEXT("="), &Key, &Val)) { V.Reasons.Add(Key); }
+		}
+
+		// The classifier's decline-to-REAL contract, made visible. When it produces a root the drift line
+		// carries "ROOT:" (MifFidelityVerifier.cpp:568); when it declined on a cap (>2000 statements /
+		// LCS cell cap / sim cap, MifDriftClassifier.cpp:81-83) or was switched off, the line falls back
+		// to the raw first-diff format with no ROOT. That text difference is the only signal available
+		// outside the verifier, and it is reported as such rather than guessed at.
+		if (V.Verdict == TEXT("drift") && !V.Detail.Contains(TEXT("ROOT:")))
+		{
+			V.Reasons.Add(TEXT("classifier-declined-or-off"));
+		}
+		return V;
+	}
+
+	static TSharedRef<FJsonObject> KrVerdictJson(const FKrFunctionVerdict& V)
+	{
+		TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+		J->SetStringField(TEXT("name"), V.Name);
+		J->SetStringField(TEXT("verdict"), V.Verdict);
+		TArray<TSharedPtr<FJsonValue>> Reasons;
+		for (const FString& R : V.Reasons) { Reasons.Add(MakeShared<FJsonValueString>(R)); }
+		J->SetArrayField(TEXT("reasons"), Reasons);
+		if (!V.Detail.IsEmpty()) { J->SetStringField(TEXT("detail"), V.Detail); }
+		return J;
+	}
+
+	/** Everything one transient reconstruct produced. Pointers deliberately absent - see THE POINTER
+	 *  RULE at the top of this block. */
+	struct FKrVerifyOutcome
+	{
+		// "" | "resolve" | "parent" | "mint" - the engine's THREE-WAY skip taxonomy, kept distinct on
+		// purpose (CompiledBlueprintCopyAction.cpp:1084-1087). Collapsing them into one "failed" loses
+		// the diagnosis: a missing asset, an unparentable class and a failed mint have different fixes.
+		FString Skip;
+		bool bMinted   = false;
+		bool bCompiled = false;      // minted AND compiled clean - the export refuses to score anything else
+		bool bVerified = false;      // the bound fidelity delegate actually ran and returned true
+		FBlueprintFidelityReport Report;
+		int32 FunctionsAttempted = 0, FunctionsReconstructed = 0;
+		int32 EventsAttempted = 0, EventsReconstructed = 0;
+		int32 CompileErrors = 0, CompileWarnings = 0;
+		FString FirstError;
+		FString ParentClass;
+		TArray<FKrFunctionVerdict> Functions;   // populated only when bPerFunction
+		int32 ElapsedMs = 0;
+	};
+
+	/** THE shared primitive behind all four endpoints: one mint -> populate -> compile -> (verify).
+	 *
+	 *  bAsChild=false (the batch sweep's default) mints a SIBLING, which copies the component tree into
+	 *  the transient package, so every component reference differs by object path and reports systematic
+	 *  FALSE drift. bVerify is therefore only ever passed true together with bAsChild - the callers
+	 *  enforce it, the export deliberately does not.
+	 *
+	 *  bPerFunction re-runs the SAME bound verifier once per attempted function with a ONE-ELEMENT
+	 *  denominator. That is how kr_classify_drift gets per-function verdicts with ZERO changes to
+	 *  MifFidelityVerifier.cpp: its loop is independent per function, so a single-element call yields
+	 *  exactly that function's verdict in the report's own counters. The alternative - a module-static
+	 *  capture sink inside the verifier - would put a second, forkable copy of the verdict logic in the
+	 *  tree and add a global that must be armed/disarmed correctly on every early return. Cost of this
+	 *  choice: the drift path's disassembly + classification runs twice for the classify endpoint only
+	 *  (once for the aggregate, once per function), which is what buys the cross-check the response
+	 *  reports as `consistent`. */
+	static void KrRunTransientVerify(UBlueprintGeneratedClass* SourceBPGC, bool bAsChild, bool bVerify,
+		bool bPerFunction, FKrVerifyOutcome& Out)
+	{
+		const double T0 = FPlatformTime::Seconds();
+		if (!SourceBPGC) { Out.Skip = TEXT("resolve"); return; }
+
+		// CHILD parents to the cooked class ITSELF, so the copy IS-A <SourceClass> and INHERITS its
+		// components instead of copying them - the only mode fidelity is measurable in. This check lives
+		// HERE and not inside the export so SKIP_PARENT keeps its own outcome (:1084-1087).
+		UClass* ParentClass = bAsChild ? static_cast<UClass*>(SourceBPGC) : SourceBPGC->GetSuperClass();
+		if (!ParentClass || !FKismetEditorUtilities::CanCreateBlueprintOfClass(ParentClass))
+		{
+			Out.Skip = TEXT("parent");
+			if (ParentClass) { Out.ParentClass = ParentClass->GetPathName(); }
+			Out.ElapsedMs = (int32)((FPlatformTime::Seconds() - T0) * 1000.0);
+			return;
+		}
+		Out.ParentClass = ParentClass->GetPathName();
+
+		FUncookedCopyStats Stats;
+		FCompilerResultsLog Results;
+		bool bVerifierRan = false;
+
+		const bool bScored = RunTransientBlueprintReconstruct(SourceBPGC, ParentClass, bAsChild, Stats, Results,
+			[&](UBlueprint* ReconBP)
+			{
+				// THE POINTER RULE: ReconBP is unrooted and RF_Transient'd by the engine the moment this
+				// returns, and Stats.AttemptedFunctions holds raw cooked UFunction*. Nothing but ints and
+				// FStrings leaves this lambda.
+				if (!bVerify || !ReconBP) { return; }
+				FOnVerifyBlueprintFidelity& Verifier = GetBlueprintFidelityVerifier();
+				if (!Verifier.IsBound())
+				{
+					// Cannot happen while this endpoint exists (it is registered by the same module that
+					// binds the verifier at startup), but checked rather than assumed: an unbound verifier
+					// would otherwise leave an all-zero report that reads exactly like a perfect all-event
+					// Blueprint. Belt-and-braces, mirroring the engine console command's own check.
+					return;
+				}
+				bVerifierRan = Verifier.Execute(SourceBPGC, ReconBP, Stats.AttemptedFunctions, Out.Report);
+
+				if (!bPerFunction) { return; }
+				for (UFunction* Func : Stats.AttemptedFunctions)
+				{
+					if (!Func) { continue; }
+					TArray<UFunction*> OneFunction;
+					OneFunction.Add(Func);
+					FBlueprintFidelityReport Single;
+					Verifier.Execute(SourceBPGC, ReconBP, OneFunction, Single);
+					Out.Functions.Add(KrVerdictFromSingle(Func->GetName(), Single));
+				}
+			});
+
+		// The export returns false for BOTH "the mint failed" and "it compiled with errors", and its
+		// contract does not separate them - but the skip taxonomy needs them separated. Discriminate on
+		// evidence that the pipeline actually RAN: a failed mint returns before PopulateUncookedCopy and
+		// before the compile, leaving both the stats block and the results log pristine. bSilentMode is
+		// the sharpest signal (RunReconstructOnce sets it immediately before CompileBlueprint, and
+		// FCompilerResultsLog defaults it to false); the rest are corroboration so this degrades to
+		// "compile failed" rather than to a wrong skip class if that ever changes.
+		Out.bMinted = Results.bSilentMode
+			|| Results.Messages.Num() > 0
+			|| Stats.AttemptedFunctions.Num() > 0
+			|| Stats.FunctionsAttempted > 0
+			|| Stats.EventsAttempted > 0;
+		Out.bCompiled = bScored;
+		Out.bVerified = bVerifierRan;
+		Out.FunctionsAttempted     = Stats.FunctionsAttempted;
+		Out.FunctionsReconstructed = Stats.FunctionsReconstructed;
+		Out.EventsAttempted        = Stats.EventsAttempted;
+		Out.EventsReconstructed    = Stats.EventsReconstructed;
+		Out.CompileErrors   = Results.NumErrors;
+		Out.CompileWarnings = Results.NumWarnings;
+		for (const TSharedRef<FTokenizedMessage>& Message : Results.Messages)
+		{
+			if (Message->GetSeverity() == EMessageSeverity::Error)
+			{
+				Out.FirstError = Message->ToText().ToString();
+				break;
+			}
+		}
+		if (!Out.bMinted) { Out.Skip = TEXT("mint"); }
+		Out.ElapsedMs = (int32)((FPlatformTime::Seconds() - T0) * 1000.0);
+	}
+
+	/** Stats + compile block, shared by all four result payloads. Events stay in their OWN fields and
+	 *  never fold into the function counters: an event body comes from slicing the ubergraph, so it has
+	 *  no own-class UFunction to diff and has no place in the fidelity denominator. Folding them would
+	 *  silently corrupt the published 54.65% number, whose denominator is AttemptedFunctions. */
+	static void KrAddStatsAndCompile(const TSharedRef<FJsonObject>& Into, const FKrVerifyOutcome& O)
+	{
+		TSharedRef<FJsonObject> Stats = MakeShared<FJsonObject>();
+		Stats->SetNumberField(TEXT("functionsAttempted"), O.FunctionsAttempted);
+		Stats->SetNumberField(TEXT("functionsReconstructed"), O.FunctionsReconstructed);
+		Stats->SetNumberField(TEXT("eventsAttempted"), O.EventsAttempted);
+		Stats->SetNumberField(TEXT("eventsReconstructed"), O.EventsReconstructed);
+		// Reported because it can be switched off: with mif.kr.Events 0 the engine still invokes the event
+		// delegate (so eventsAttempted stays honest) but every body stays a bare stub and
+		// eventsReconstructed collapses to 0. Without this field that reads like a decompiler regression.
+		if (IConsoleVariable* EventsCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("mif.kr.Events")))
+		{
+			Stats->SetBoolField(TEXT("eventsEnabled"), EventsCVar->GetInt() != 0);
+		}
+		Into->SetObjectField(TEXT("stats"), Stats);
+
+		TSharedRef<FJsonObject> Compile = MakeShared<FJsonObject>();
+		Compile->SetBoolField(TEXT("measured"), true);   // unlike copy mode, this pipeline owns its results log
+		Compile->SetNumberField(TEXT("errors"), O.CompileErrors);
+		Compile->SetNumberField(TEXT("warnings"), O.CompileWarnings);
+		if (!O.FirstError.IsEmpty()) { Compile->SetStringField(TEXT("firstError"), O.FirstError); }
+		Into->SetObjectField(TEXT("compile"), Compile);
+	}
+
+	// --- Corpus enumeration (mirror of the engine gate, ungated) -----------------------------------
+
+	/** Mirror of the engine's IsCompiledBlueprintAsset (CompiledBlueprintCopyAction.cpp:102-119) - the
+	 *  ONE predicate that decides what F3 and mif.kr.ReconstructAll operate on, and therefore the only
+	 *  honest target set for a census or a batch sweep. Reimplemented because that predicate is
+	 *  file-static in the engine TU (the SHIP-SAFETY block at the top of this file, applied to engine
+	 *  statics). SYNC CONTRACT: if the engine predicate gains a class, this must gain it too.
+	 *
+	 *  EXACT class-path equality, deliberately NOT the bRecursiveClasses shape kr_list_cooked_blueprints
+	 *  uses - and the difference is load-bearing, not an oversight. It is exactly what EXCLUDES
+	 *  UAnimBlueprintGeneratedClass (see KrIsAnimBlueprintClass): an anim source mints a plain UBlueprint
+	 *  and loses its AnimGraph, so censusing one would feed a degraded copy's score into the corpus
+	 *  number this endpoint publishes. Diverging here would corrupt the metric.
+	 *
+	 *  The two Widget class paths are matched by class NAME rather than by StaticClass()->GetClassPathName()
+	 *  for the same no-new-dependency reason IsWidgetAsset gives above: naming UWidgetBlueprint would drag
+	 *  UMGEditor into this module's Build.cs for one comparison. */
+	static bool KrIsCompiledBlueprintAsset(const FAssetData& A)
+	{
+		if (!A.IsValid() || (A.PackageFlags & PKG_Cooked) == 0) { return false; }
+		if (A.AssetClassPath == UBlueprint::StaticClass()->GetClassPathName()) { return true; }
+		if (A.AssetClassPath == UBlueprintGeneratedClass::StaticClass()->GetClassPathName()) { return true; }
+		const FString ClassName = A.AssetClassPath.GetAssetName().ToString();
+		return ClassName.Equals(TEXT("WidgetBlueprint"), ESearchCase::CaseSensitive)
+			|| ClassName.Equals(TEXT("WidgetBlueprintGeneratedClass"), ESearchCase::CaseSensitive);
+	}
+
+	struct FKrSweepTarget
+	{
+		FString ObjectPath;    // re-resolved every slice - never a raw pointer held across ticks
+		FString PackageName;
+	};
+
+	/** The census/batch target set: cooked, gate-passing, package-deduped, sorted by package name.
+	 *  Mirrors the engine batch harness's enumeration (:1149-1169) so a census result is comparable to a
+	 *  mif.kr.ReconstructAll run over the same filter. Anim Blueprints are counted as they are excluded
+	 *  (OutAnimExcluded) instead of vanishing: a silent exclusion is indistinguishable from an asset that
+	 *  was never there, and the anim gap is a known, deliberate limitation that a caller must be able to
+	 *  see the size of. */
+	static bool KrEnumerateSweepTargets(const FString& PathFilter, TArray<FKrSweepTarget>& OutTargets,
+		int32& OutAnimExcluded, int32& OutCorpusTotal, FString& OutError)
+	{
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		if (Registry.IsLoadingAssets())
+		{
+			// A partial index would report a SMALLER corpus with ok:true - the silent-wrong-answer class
+			// this bridge refuses, and here it would understate a published fidelity number.
+			OutError = TEXT("asset registry still scanning; retry after the initial scan completes");
+			return false;
+		}
+
+		FARFilter Filter;
+		Filter.ClassPaths.Add(UBlueprintGeneratedClass::StaticClass()->GetClassPathName());
+		Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+		Filter.bRecursiveClasses = true;   // SEE the anim/widget subclasses, then judge them by the exact gate
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+
+		const bool bAllPaths = (PathFilter == TEXT("*"));
+		TSet<FName> SeenPackages;
+		TSet<FName> AnimPackages;
+		TSet<FName> CorpusPackages;
+		for (const FAssetData& A : Assets)
+		{
+			if (!A.IsValid()) { continue; }
+			if ((A.PackageFlags & PKG_Cooked) != 0) { CorpusPackages.Add(A.PackageName); }
+			// Path filter FIRST so the anim-exclusion count describes the requested set, not the project.
+			if (!bAllPaths && !A.PackageName.ToString().Contains(PathFilter)) { continue; }
+			if (!KrIsCompiledBlueprintAsset(A))
+			{
+				if ((A.PackageFlags & PKG_Cooked) != 0
+					&& A.AssetClassPath.GetAssetName().ToString().StartsWith(TEXT("AnimBlueprint")))
+				{
+					AnimPackages.Add(A.PackageName);
+				}
+				continue;
+			}
+			if (SeenPackages.Contains(A.PackageName)) { continue; }
+			SeenPackages.Add(A.PackageName);
+			FKrSweepTarget T;
+			T.ObjectPath  = A.GetObjectPathString();
+			T.PackageName = A.PackageName.ToString();
+			OutTargets.Add(T);
+		}
+
+		// Deterministic order: a startIndex resume cursor is meaningless unless the same filter enumerates
+		// the same Blueprints in the same order across runs (TSet/TMap iteration order is not an order).
+		OutTargets.Sort([](const FKrSweepTarget& L, const FKrSweepTarget& R)
+		{
+			return L.PackageName < R.PackageName;
+		});
+		OutAnimExcluded = AnimPackages.Num();
+		OutCorpusTotal  = CorpusPackages.Num();
+		return true;
+	}
+
+	// --- kr_verify_fidelity / kr_classify_drift: the single-BP deferred job ------------------------
+
+	struct FKrVerifyPlan
+	{
+		FString JobId;
+		FString Kind;                 // "verify" | "classify"
+		FString SourceClassPath;      // re-resolved after the tick; never a captured raw pointer
+		FString SourceAsset;
+		FString BpName;
+		bool    bClassifyIntentional = true;
+		bool    bPerFunction = false;
+		bool    bAnimAllowed = false;
+		FString FunctionFilter;
+	};
+
+	static void KrRunVerifyJob(FKrVerifyPlan Plan)
+	{
+		using namespace MifKr::Jobs;
+
+		if (!HasRecord() || Get().JobId != Plan.JobId)
+		{
+			// A stale timer firing against a different job would corrupt that job's counters. Checked,
+			// not assumed - the same guard KrRunReconstructJob carries.
+			return;
+		}
+
+		MarkRunning(TEXT("resolving"));
+
+		FString ResolveError;
+		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(Plan.SourceClassPath, ResolveError);
+		if (!BPGC)
+		{
+			Finish(false, FString::Printf(TEXT("source class disappeared between request and execution: %s"), *ResolveError));
+			return;
+		}
+
+		UE_LOG(LogMifKismetReconstructor, Warning, TEXT("[kr job] %s BEGIN kind=%s source=%s classify=%d perFunction=%d"),
+			*Plan.JobId, *Plan.Kind, *BPGC->GetPathName(), Plan.bClassifyIntentional ? 1 : 0, Plan.bPerFunction ? 1 : 0);
+		if (GLog) { GLog->Flush(); }   // flushed BEGIN marker: a hard crash names the culprit
+
+		// Scoped for THIS job only, restored before the record reports done - so a caller who asks for
+		// the pre-classifier audit baseline does not silently leave the editor in that state.
+		FKrScopedCVarInt ClassifyScope(TEXT("mif.kr.ClassifyIntentional"), Plan.bClassifyIntentional ? 1 : 0);
+
+		SetPhase(TEXT("reconstructing"));
+		FKrVerifyOutcome Outcome;
+		KrRunTransientVerify(BPGC, /*bAsChild*/ true, /*bVerify*/ true, Plan.bPerFunction, Outcome);
+		SetPhase(TEXT("verifying"));
+
+		FJobRecord& Job = Mutable();
+		Job.bCompileMeasured = true;
+		Job.CompileErrors = Outcome.CompileErrors;
+		Job.CompileWarnings = Outcome.CompileWarnings;
+		Job.FirstError = Outcome.FirstError;
+
+		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("sourceAsset"), Plan.SourceAsset);
+		Result->SetStringField(TEXT("sourceClass"), BPGC->GetPathName());
+		Result->SetBoolField(TEXT("sourceCooked"), KrIsCooked(BPGC));
+		Result->SetStringField(TEXT("bpName"), Plan.BpName);
+		Result->SetStringField(TEXT("mode"), TEXT("child"));
+		Result->SetStringField(TEXT("parentClass"), Outcome.ParentClass);
+		Result->SetBoolField(TEXT("classifyIntentional"), Plan.bClassifyIntentional);
+		Result->SetBoolField(TEXT("classifyIntentionalApplied"), ClassifyScope.Applied());
+		if (!ClassifyScope.Applied())
+		{
+			Result->SetStringField(TEXT("classifyIntentionalNote"), ClassifyScope.Found()
+				? TEXT("mif.kr.ClassifyIntentional could NOT be overridden for this job (something set it at a higher priority) - the numbers below were produced with its CURRENT value, not the requested one")
+				: TEXT("mif.kr.ClassifyIntentional is not registered - the classifier is not present in this build, so intentional is structurally 0"));
+		}
+		Result->SetNumberField(TEXT("elapsedMs"), Outcome.ElapsedMs);
+		if (KrIsAnimBlueprintClass(BPGC))
+		{
+			// Forced past the refusal with allowAnim:true. The numbers are real measurements of a
+			// DEGRADED copy - say so in the payload, not only in the request that allowed it.
+			Result->SetBoolField(TEXT("animBlueprint"), true);
+			Result->SetBoolField(TEXT("allowAnim"), Plan.bAnimAllowed);
+			Result->SetBoolField(TEXT("degraded"), true);
+			Result->SetStringField(TEXT("degradedReason"),
+				TEXT("this is an Animation Blueprint and the engine mints anim sources as a PLAIN UBlueprint ")
+				TEXT("(GetBlueprintClassTypesForSource special-cases only Widget), so the copy has no AnimGraph at all. ")
+				TEXT("Every number below describes that degraded copy, NOT the decompiler. Do not compare it to the corpus."));
+		}
+
+		if (!Outcome.Skip.IsEmpty())
+		{
+			Job.Result = Result;
+			const TCHAR* Why =
+				Outcome.Skip == TEXT("parent")
+					? TEXT("cannot create a Blueprint parented to this class (FKismetEditorUtilities::CanCreateBlueprintOfClass refused it)")
+					: TEXT("could not mint a transient copy (CreateBlueprint failed) - nothing was populated and nothing compiled");
+			Result->SetStringField(TEXT("skip"), Outcome.Skip);
+			Finish(false, FString::Printf(TEXT("%s: %s"), *Plan.BpName, Why));
+			return;
+		}
+
+		Result->SetBoolField(TEXT("minted"), Outcome.bMinted);
+		Result->SetBoolField(TEXT("compiled"), Outcome.bCompiled);
+		KrAddStatsAndCompile(Result, Outcome);
+
+		if (!Outcome.bCompiled)
+		{
+			// The honesty rule, enforced by the engine export itself: a failed compile leaves the
+			// GeneratedClass bytecode absent or stale, so the verifier is never invoked and NO fidelity
+			// number can leak. The job is `done` (the work ran and produced a truthful answer), the
+			// fidelity block is absent, and the reason is stated - not ok:true with a silent 0/0.
+			Result->SetBoolField(TEXT("fidelityMeasured"), false);
+			Result->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("%s failed to compile (%d errors) - fidelity not measured. A failed compile leaves no trustworthy ")
+				TEXT("bytecode to diff, so scoring it would be a lie."), *Plan.BpName, Outcome.CompileErrors));
+			Job.Result = Result;
+			Finish(true, FString());
+			return;
+		}
+
+		Result->SetBoolField(TEXT("fidelityMeasured"), Outcome.bVerified);
+		Result->SetObjectField(TEXT("fidelity"), KrFidelityJson(Outcome.Report));
+
+		// Numerically checkable invariants, computed here so a caller does not have to trust the prose.
+		// scored == identical+equivalent+intentional+drift+missing is the report's own definition, and
+		// adjustedScore >= score holds because the adjusted numerator adds intentional to the same
+		// denominator. If either is ever false the report is internally inconsistent and the number
+		// must not be used - which is exactly why they are reported rather than assumed.
+		{
+			const FBlueprintFidelityReport& R = Outcome.Report;
+			TSharedRef<FJsonObject> Inv = MakeShared<FJsonObject>();
+			Inv->SetBoolField(TEXT("scoredEqualsSum"),
+				R.Scored() == (R.Identical + R.Equivalent + R.Intentional + R.Drift + R.Missing));
+			Inv->SetBoolField(TEXT("adjustedGeScore"), !R.HasScore() || (R.AdjustedScore() >= R.Score()));
+			Inv->SetBoolField(TEXT("comparedEqualsScoredMinusMissing"), R.Compared == (R.Scored() - R.Missing));
+			Result->SetObjectField(TEXT("invariants"), Inv);
+		}
+
+		if (Plan.bPerFunction)
+		{
+			TArray<TSharedPtr<FJsonValue>> Rows;
+			TMap<FString, int32> ByVerdict;
+			TMap<FString, int32> ReasonTally;
+			bool bFilterFound = Plan.FunctionFilter.IsEmpty();
+			TArray<FString> AllNames;
+			for (const FKrFunctionVerdict& V : Outcome.Functions)
+			{
+				AllNames.Add(V.Name);
+				++ByVerdict.FindOrAdd(V.Verdict);
+				for (const FString& R : V.Reasons) { ++ReasonTally.FindOrAdd(R); }
+				if (!Plan.FunctionFilter.IsEmpty())
+				{
+					if (!V.Name.Equals(Plan.FunctionFilter, ESearchCase::IgnoreCase)) { continue; }
+					bFilterFound = true;
+				}
+				Rows.Add(MakeShared<FJsonValueObject>(KrVerdictJson(V)));
+			}
+			Result->SetArrayField(TEXT("functions"), Rows);
+			Result->SetNumberField(TEXT("functionsReported"), Rows.Num());
+			Result->SetNumberField(TEXT("functionsAttemptedRows"), Outcome.Functions.Num());
+
+			TSharedRef<FJsonObject> Counts = MakeShared<FJsonObject>();
+			for (const TPair<FString, int32>& KV : ByVerdict) { Counts->SetNumberField(KV.Key, KV.Value); }
+			Result->SetObjectField(TEXT("verdictCounts"), Counts);
+
+			// THE cross-check the two-pass design buys: the per-function decomposition and the whole-BP
+			// aggregate are produced by two INDEPENDENT verifier runs, so agreement is evidence, not a
+			// tautology. A false here means the decomposition is not faithful and the rows must not be
+			// trusted - reported as a number rather than asserted away.
+			auto CountOf = [&ByVerdict](const TCHAR* Key) { const int32* P = ByVerdict.Find(Key); return P ? *P : 0; };
+			const FBlueprintFidelityReport& R = Outcome.Report;
+			const bool bConsistent =
+				CountOf(TEXT("identical"))    == R.Identical &&
+				CountOf(TEXT("equivalent"))   == R.Equivalent &&
+				CountOf(TEXT("intentional"))  == R.Intentional &&
+				CountOf(TEXT("drift"))        == R.Drift &&
+				CountOf(TEXT("missing"))      == R.Missing &&
+				CountOf(TEXT("uncomparable")) == R.Uncomparable;
+			Result->SetBoolField(TEXT("consistent"), bConsistent);
+			if (!bConsistent)
+			{
+				Result->SetStringField(TEXT("consistentNote"),
+					TEXT("the per-function rows do NOT sum to the aggregate report - the decomposition is unfaithful and ")
+					TEXT("the rows must not be used. The aggregate (one whole-BP verifier run) is the trustworthy half."));
+			}
+
+			TArray<FString> ReasonKeys;
+			ReasonTally.GetKeys(ReasonKeys);
+			ReasonKeys.Sort();
+			TArray<FString> ReasonParts;
+			for (const FString& K : ReasonKeys) { ReasonParts.Add(FString::Printf(TEXT("%s=%d"), *K, ReasonTally[K])); }
+			Result->SetStringField(TEXT("reasonTally"), FString::Join(ReasonParts, TEXT(";")));
+
+			if (!Plan.FunctionFilter.IsEmpty())
+			{
+				Result->SetStringField(TEXT("functionFilter"), Plan.FunctionFilter);
+				Result->SetBoolField(TEXT("functionFound"), bFilterFound);
+				if (!bFilterFound)
+				{
+					// Never a silent empty array: name what WAS attempted so the caller can correct the
+					// spelling instead of concluding the function has no drift.
+					TArray<TSharedPtr<FJsonValue>> Names;
+					for (const FString& N : AllNames) { Names.Add(MakeShared<FJsonValueString>(N)); }
+					Result->SetArrayField(TEXT("attemptedFunctions"), Names);
+					Result->SetStringField(TEXT("functionNote"), FString::Printf(
+						TEXT("'%s' was never attempted on %s - the decompiler delegate was not invoked on it (it is inherited, ")
+						TEXT("has no bytecode, or is the ubergraph). attemptedFunctions lists what WAS attempted."),
+						*Plan.FunctionFilter, *Plan.BpName));
+				}
+			}
+			Result->SetStringField(TEXT("perFunctionNote"),
+				TEXT("verdicts come from re-running the SAME bound verifier once per attempted function with a one-element ")
+				TEXT("denominator, so each row is that function's own verdict. `detail` is the verifier's own root/audit line, ")
+				TEXT("verbatim: 'ROOT:' present means the classifier attributed the root cause; absent means it declined ")
+				TEXT("(a cap) or is off, and reasons then carry classifier-declined-or-off."));
+		}
+
+		Job.Result = Result;
+		Finish(true, FString());
+	}
+
+	// --- kr_drift_census / kr_batch_reconstruct: the sliced sweep ----------------------------------
+
+	/** Sweep state, alive across ticks. ONE instance, because there is ONE job slot: a second sweep
+	 *  cannot exist without the job model first refusing the request. Holds package/object PATHS, never
+	 *  UObject pointers - a raw pointer held across a tick boundary (with a CollectGarbage every 25
+	 *  Blueprints in between) is precisely the lifetime bug the pipeline's own FGCScopeGuard exists for. */
+	struct FKrSweepState
+	{
+		FString JobId;
+		FString Kind;                    // "census" | "batch"
+		TArray<FKrSweepTarget> Targets;
+		int32 StartIndex = 0;
+		int32 Index = 0;                 // absolute index into Targets
+		int32 EndIndex = 0;              // exclusive
+		bool  bAsChild = true;
+		bool  bVerify = true;
+		bool  bClassifyIntentional = true;
+		FString PathFilter;
+		int32 AnimExcluded = 0;
+		int32 CorpusTotal = 0;
+
+		int32 Pass = 0, Fail = 0, Skip = 0;
+		int32 SkipResolve = 0, SkipParent = 0, SkipMint = 0;
+		int32 Identical = 0, Equivalent = 0, Intentional = 0, Drift = 0, Missing = 0, Uncomparable = 0;
+		int32 FunctionsAttempted = 0, FunctionsReconstructed = 0;
+		int32 EventsAttempted = 0, EventsReconstructed = 0;
+		TMap<FString, int32> IntentTally;
+
+		int32 GcRuns = 0;
+		int32 LastBpMs = 0, MaxBpMs = 0;
+		FString MaxBpName;
+		FString CurrentPackage;
+
+		TUniquePtr<FArchive> Csv;
+		FString CsvPath;
+		int32 CsvRows = 0;
+
+		TUniquePtr<FKrScopedCVarInt> ClassifyScope;
+		TUniquePtr<FKrScopedCVarInt> CensusScope;
+	};
+
+	static TUniquePtr<FKrSweepState> GSweep;
+
+	static void KrSweepWriteCsvLine(FKrSweepState& S, const FString& Line)
+	{
+		if (!S.Csv) { return; }
+		const FString L = Line + LINE_TERMINATOR;
+		FTCHARToUTF8 Conv(*L);
+		S.Csv->Serialize((void*)Conv.Get(), Conv.Length());
+		S.Csv->Flush();   // per row: a hard engine assert must preserve partial results AND name the culprit
+	}
+
+	static FString KrCsvCell(const FString& S)
+	{
+		return S.Replace(TEXT(","), TEXT(";")).Replace(TEXT("\n"), TEXT(" ")).Replace(TEXT("\r"), TEXT(" "));
+	}
+
+	/** The running/final payload, rebuilt every slice so a mid-sweep poll sees live numbers. */
+	static TSharedRef<FJsonObject> KrSweepResultJson(const FKrSweepState& S, bool bFinal)
+	{
+		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+
+		TSharedRef<FJsonObject> FilterEcho = MakeShared<FJsonObject>();
+		FilterEcho->SetStringField(TEXT("pathFilter"), S.PathFilter);
+		FilterEcho->SetNumberField(TEXT("startIndex"), S.StartIndex);
+		FilterEcho->SetStringField(TEXT("mode"), S.bAsChild ? TEXT("child") : TEXT("sibling"));
+		FilterEcho->SetBoolField(TEXT("verify"), S.bVerify);
+		FilterEcho->SetBoolField(TEXT("classifyIntentional"), S.bClassifyIntentional);
+		// Reported, not assumed: a CVar Set is refused silently when something wrote it at a higher
+		// priority, and a census whose instrument never turned on must say so rather than return an
+		// empty CSV that reads like "no unclaimed drift".
+		FilterEcho->SetBoolField(TEXT("classifyIntentionalApplied"), S.ClassifyScope.IsValid() && S.ClassifyScope->Applied());
+		if (S.CensusScope.IsValid())
+		{
+			FilterEcho->SetBoolField(TEXT("driftCensusApplied"), S.CensusScope->Applied());
+		}
+		FilterEcho->SetBoolField(TEXT("cookedOnly"), true);
+		R->SetObjectField(TEXT("filter"), FilterEcho);
+
+		const int32 Done = S.Index - S.StartIndex;
+		R->SetNumberField(TEXT("bpTotal"), S.EndIndex - S.StartIndex);
+		R->SetNumberField(TEXT("bpDone"), Done);
+		R->SetNumberField(TEXT("bpIndexAbsolute"), S.Index);
+		R->SetNumberField(TEXT("corpusPackages"), S.CorpusTotal);
+		R->SetNumberField(TEXT("pass"), S.Pass);
+		R->SetNumberField(TEXT("fail"), S.Fail);
+		R->SetNumberField(TEXT("skip"), S.Skip);
+		R->SetBoolField(TEXT("complete"), bFinal);
+		if (!S.CurrentPackage.IsEmpty() && !bFinal) { R->SetStringField(TEXT("currentPackage"), S.CurrentPackage); }
+
+		TSharedRef<FJsonObject> Tax = MakeShared<FJsonObject>();
+		Tax->SetNumberField(TEXT("resolve"), S.SkipResolve);
+		Tax->SetNumberField(TEXT("parent"), S.SkipParent);
+		Tax->SetNumberField(TEXT("mint"), S.SkipMint);
+		R->SetObjectField(TEXT("skipTaxonomy"), Tax);
+
+		TSharedRef<FJsonObject> Stats = MakeShared<FJsonObject>();
+		Stats->SetNumberField(TEXT("functionsAttempted"), S.FunctionsAttempted);
+		Stats->SetNumberField(TEXT("functionsReconstructed"), S.FunctionsReconstructed);
+		Stats->SetNumberField(TEXT("eventsAttempted"), S.EventsAttempted);
+		Stats->SetNumberField(TEXT("eventsReconstructed"), S.EventsReconstructed);
+		if (IConsoleVariable* EventsCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("mif.kr.Events")))
+		{
+			Stats->SetBoolField(TEXT("eventsEnabled"), EventsCVar->GetInt() != 0);   // see KrAddStatsAndCompile
+		}
+		R->SetObjectField(TEXT("stats"), Stats);
+
+		if (S.bVerify)
+		{
+			const int32 Scored = S.Identical + S.Equivalent + S.Intentional + S.Drift + S.Missing;
+			TSharedRef<FJsonObject> Totals = MakeShared<FJsonObject>();
+			Totals->SetNumberField(TEXT("identical"), S.Identical);
+			Totals->SetNumberField(TEXT("equivalent"), S.Equivalent);
+			Totals->SetNumberField(TEXT("intentional"), S.Intentional);
+			Totals->SetNumberField(TEXT("drift"), S.Drift);
+			Totals->SetNumberField(TEXT("missing"), S.Missing);
+			Totals->SetNumberField(TEXT("uncomparable"), S.Uncomparable);
+			Totals->SetNumberField(TEXT("compared"), Scored);
+			R->SetObjectField(TEXT("totals"), Totals);
+
+			// RAW AND ADJUSTED, ALWAYS TOGETHER. An adjusted number quoted without its raw twin is how a
+			// metric starts lying; and neither describes the all-event Blueprints, which score nothing at
+			// all. Both are null when nothing was scored - never 1.000, never a sentinel.
+			if (Scored > 0)
+			{
+				R->SetNumberField(TEXT("corpusFidelity"), float(S.Identical + S.Equivalent) / float(Scored));
+				R->SetNumberField(TEXT("corpusAdjusted"), float(S.Identical + S.Equivalent + S.Intentional) / float(Scored));
+			}
+			else
+			{
+				R->SetField(TEXT("corpusFidelity"), MakeShared<FJsonValueNull>());
+				R->SetField(TEXT("corpusAdjusted"), MakeShared<FJsonValueNull>());
+			}
+
+			TArray<FString> Keys;
+			S.IntentTally.GetKeys(Keys);
+			Keys.Sort();
+			TArray<FString> Parts;
+			for (const FString& K : Keys) { Parts.Add(FString::Printf(TEXT("%s=%d"), *K, S.IntentTally[K])); }
+			R->SetStringField(TEXT("intentTally"), FString::Join(Parts, TEXT(";")));
+		}
+
+		R->SetNumberField(TEXT("animExcluded"), S.AnimExcluded);
+		R->SetStringField(TEXT("animNote"),
+			TEXT("Animation Blueprints are EXCLUDED from the target set by the same exact-class-path gate F3 uses: an anim ")
+			TEXT("source mints a plain UBlueprint and loses its AnimGraph, so its score would describe the mint, not the ")
+			TEXT("decompiler. Counted here so the exclusion is visible, never silent."));
+
+		R->SetNumberField(TEXT("lastBpMs"), S.LastBpMs);
+		R->SetNumberField(TEXT("maxBpMs"), S.MaxBpMs);
+		if (!S.MaxBpName.IsEmpty()) { R->SetStringField(TEXT("maxBpName"), S.MaxBpName); }
+		R->SetNumberField(TEXT("gcRuns"), S.GcRuns);
+		R->SetNumberField(TEXT("resumeHint"), S.Index);
+		R->SetStringField(TEXT("resumeNote"),
+			TEXT("if the editor dies mid-sweep, re-issue the SAME call with startIndex = resumeHint; the target order is ")
+			TEXT("sorted by package name, so the enumeration is stable across runs."));
+
+		if (!S.CsvPath.IsEmpty())
+		{
+			R->SetStringField(TEXT("csvPath"), S.CsvPath);
+			R->SetNumberField(TEXT("csvRows"), S.CsvRows);
+		}
+		else
+		{
+			R->SetField(TEXT("csvPath"), MakeShared<FJsonValueNull>());
+			R->SetStringField(TEXT("csvNote"),
+				TEXT("the per-Blueprint CSV could not be opened; the counters above are unaffected (the CSV is the forensic copy, not the answer)"));
+		}
+		return R;
+	}
+
+	/** Corpus reference numbers the reconstructor has already recorded, echoed so a census result is
+	 *  comparable to them without a human going to look them up. These are the published baseline; a
+	 *  census over the SAME filter that lands far from them is a decompiler regression, not noise. */
+	static void KrAddCorpusBaseline(const TSharedRef<FJsonObject>& Into)
+	{
+		TSharedRef<FJsonObject> B = MakeShared<FJsonObject>();
+		B->SetNumberField(TEXT("cookedBlueprintPackagesAnalysed"), 1277);
+		B->SetNumberField(TEXT("batchBlueprints"), 1256);
+		B->SetNumberField(TEXT("batchPass"), 1228);
+		B->SetNumberField(TEXT("rawFidelityPct"), 54.65);
+		B->SetNumberField(TEXT("eventsReconstructedPct"), 85.9);
+		B->SetNumberField(TEXT("allEventBlueprintsScoringNothing"), 735);
+		B->SetNumberField(TEXT("allEventBlueprintsOf"), 1250);
+		B->SetStringField(TEXT("note"),
+			TEXT("published corpus baseline for comparison ONLY - it is not this run's data. A run over a narrower ")
+			TEXT("pathFilter is not comparable to it; only a whole-corpus run is."));
+		Into->SetObjectField(TEXT("corpusBaseline"), B);
+	}
+
+	/** Newest <ProjectSaved>/MifKr/DriftCensus_*.csv, plus its size and row count.
+	 *
+	 *  Discovered by SCANNING rather than reported by the classifier: the classifier opens that file
+	 *  lazily on the first unclaimed edit, keeps it in a file-static TUniquePtr for the rest of the
+	 *  session, and exposes no accessor - and it is inside another TU, so nothing here may reach in.
+	 *  Reporting the scan honestly (with censusCsvDiscovered) beats either inventing a path or
+	 *  returning nothing. */
+	static void KrAttachCensusCsv(const TSharedRef<FJsonObject>& Into)
+	{
+		const FString Dir = FPaths::ProjectSavedDir() / TEXT("MifKr");
+		TArray<FString> Files;
+		IFileManager::Get().FindFiles(Files, *(Dir / TEXT("DriftCensus_*.csv")), /*Files*/ true, /*Directories*/ false);
+		FString BestPath;
+		FDateTime BestStamp = FDateTime::MinValue();
+		for (const FString& F : Files)
+		{
+			const FString Full = Dir / F;
+			const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*Full);
+			if (Stamp > BestStamp) { BestStamp = Stamp; BestPath = Full; }
+		}
+		if (BestPath.IsEmpty())
+		{
+			Into->SetField(TEXT("censusCsvPath"), MakeShared<FJsonValueNull>());
+			Into->SetStringField(TEXT("censusCsvNote"),
+				TEXT("no DriftCensus_*.csv exists under <ProjectSaved>/MifKr - the census file is written only when an ")
+				TEXT("UNCLAIMED drift edit occurs, so zero rows means zero unclaimed edits. Verdicts are unaffected either ")
+				TEXT("way (the census is diagnostic only)."));
+			return;
+		}
+		Into->SetStringField(TEXT("censusCsvPath"), BestPath);
+		Into->SetNumberField(TEXT("censusCsvBytes"), (double)IFileManager::Get().FileSize(*BestPath));
+		Into->SetStringField(TEXT("censusCsvModifiedUtc"), BestStamp.ToIso8601());
+
+		// Row count so the caller can check it against the drift totals. Capped: reading an unbounded
+		// diagnostic file into memory inside a game-thread handler is not worth a nicer number.
+		const int64 Size = IFileManager::Get().FileSize(*BestPath);
+		if (Size >= 0 && Size <= 4 * 1024 * 1024)
+		{
+			FString Text;
+			if (FFileHelper::LoadFileToString(Text, *BestPath))
+			{
+				int32 Lines = 0;
+				for (int32 i = 0; i < Text.Len(); ++i) { if (Text[i] == TEXT('\n')) { ++Lines; } }
+				Into->SetNumberField(TEXT("censusCsvRows"), FMath::Max(0, Lines - 1));   // minus the header
+			}
+		}
+		else
+		{
+			Into->SetStringField(TEXT("censusCsvRowsNote"),
+				TEXT("row count not computed: the file exceeds the 4 MB read cap for a game-thread handler"));
+		}
+		Into->SetStringField(TEXT("censusCsvNote"),
+			TEXT("DISCOVERED BY SCANNING <ProjectSaved>/MifKr for the newest DriftCensus_*.csv - the classifier opens that ")
+			TEXT("file lazily and exposes no path accessor. It is opened ONCE per editor session, so a second census in the ")
+			TEXT("same session APPENDS to the same file: compare censusCsvRows across runs, not in absolute terms."));
+	}
+
+	static void KrSweepTick();
+
+	static void KrSweepFinish(FKrSweepState& S, bool bOk, const FString& Error)
+	{
+		using namespace MifKr::Jobs;
+
+		// Mirrors the engine batch harness's closing collect (:1306). Between-Blueprint only, never
+		// inside one: the decompiler holds raw UFunction*/UClass* while a Blueprint is in flight.
+		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		++S.GcRuns;
+
+		if (S.Csv)
+		{
+			const int32 Scored = S.Identical + S.Equivalent + S.Intentional + S.Drift + S.Missing;
+			KrSweepWriteCsvLine(S, FString::Printf(
+				TEXT("# TOTAL pass=%d fail=%d skip=%d of %d | ident=%d equiv=%d intentional=%d drift=%d missing=%d uncomparable=%d compared=%d"),
+				S.Pass, S.Fail, S.Skip, S.EndIndex - S.StartIndex,
+				S.Identical, S.Equivalent, S.Intentional, S.Drift, S.Missing, S.Uncomparable, Scored));
+			S.Csv->Flush();
+			S.Csv.Reset();
+		}
+
+		TSharedRef<FJsonObject> Result = KrSweepResultJson(S, /*bFinal*/ true);
+		if (S.Kind == TEXT("census"))
+		{
+			KrAttachCensusCsv(Result);
+			KrAddCorpusBaseline(Result);
+		}
+		Result->SetStringField(TEXT("note"),
+			TEXT("sliced ONE Blueprint per tick, so bpDone advanced across polls - this is the only kr job kind with real ")
+			TEXT("mid-job progress. pass+fail+skip == bpDone, and skipTaxonomy sums to skip. Every throwaway copy was minted ")
+			TEXT("into the transient package and torn down by the engine: nothing was saved, registered or opened."));
+
+		FJobRecord& Job = Mutable();
+		Job.Result = Result;
+		Job.bCompileMeasured = true;
+
+		// The CVar overrides are released HERE, before the record reports done - so a caller that polls
+		// `done` and immediately runs a console verify is not silently in census mode.
+		S.CensusScope.Reset();
+		S.ClassifyScope.Reset();
+
+		Finish(bOk, Error);
+		GSweep.Reset();
+	}
+
+	/** ONE Blueprint, then re-arm. The whole point: between slices the game-thread ticker pumps HTTP, so
+	 *  a poll is actually read and answered. A synchronous loop here would stall the listener for the
+	 *  entire sweep and make progress physically unobservable. */
+	static void KrSweepTick()
+	{
+		using namespace MifKr::Jobs;
+
+		if (!GSweep) { return; }
+		FKrSweepState& S = *GSweep;
+
+		if (!HasRecord() || Get().JobId != S.JobId)
+		{
+			// The slot was taken by another job - abandon quietly rather than corrupt its counters.
+			GSweep.Reset();
+			return;
+		}
+		if (!GEditor)
+		{
+			KrSweepFinish(S, false, TEXT("GEditor disappeared mid-sweep - the remaining Blueprints were not processed"));
+			return;
+		}
+
+		MarkRunning(TEXT("sweeping"));
+
+		if (S.Index >= S.EndIndex)
+		{
+			KrSweepFinish(S, true, FString());
+			return;
+		}
+
+		const FKrSweepTarget Target = S.Targets[S.Index];
+		S.CurrentPackage = Target.PackageName;
+
+		// Flushed BEGIN marker, mirroring the engine harness (:1222-1224): if a Blueprint hard-asserts
+		// mid-sweep the last line in the log names the exact culprit, and resumeHint names where to resume.
+		UE_LOG(LogMifKismetReconstructor, Warning, TEXT("[kr %s] %s %d/%d BEGIN %s"),
+			*S.Kind, *S.JobId, S.Index, S.EndIndex - 1, *Target.PackageName);
+		if (GLog) { GLog->Flush(); }
+
+		FString ResolveError;
+		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(Target.ObjectPath, ResolveError);
+
+		FKrVerifyOutcome Outcome;
+		if (!BPGC)
+		{
+			Outcome.Skip = TEXT("resolve");
+		}
+		else
+		{
+			KrRunTransientVerify(BPGC, S.bAsChild, S.bVerify, /*bPerFunction*/ false, Outcome);
+		}
+
+		const FString BpName = BPGC ? BPGC->GetName() : FString();
+		S.LastBpMs = Outcome.ElapsedMs;
+		if (Outcome.ElapsedMs > S.MaxBpMs) { S.MaxBpMs = Outcome.ElapsedMs; S.MaxBpName = Target.PackageName; }
+
+		if (!Outcome.Skip.IsEmpty())
+		{
+			++S.Skip;
+			if      (Outcome.Skip == TEXT("resolve")) { ++S.SkipResolve; }
+			else if (Outcome.Skip == TEXT("parent"))  { ++S.SkipParent; }
+			else                                      { ++S.SkipMint; }
+			// Skip rows carry the base 9 fields and are padded out so they still line up under the
+			// 17-column verify header - the engine harness's own convention.
+			const FString Row = FString::Printf(TEXT("%d,%s,%s,,,SKIP_%s,,,"),
+				S.Index, *KrCsvCell(Target.PackageName), *KrCsvCell(BpName), *Outcome.Skip.ToUpper());
+			KrSweepWriteCsvLine(S, Row + (S.bVerify ? FString::ChrN(8, TEXT(',')) : FString()));
+			++S.CsvRows;
+		}
+		else
+		{
+			const bool bFail = !Outcome.bCompiled;
+			if (bFail) { ++S.Fail; } else { ++S.Pass; }
+
+			S.FunctionsAttempted     += Outcome.FunctionsAttempted;
+			S.FunctionsReconstructed += Outcome.FunctionsReconstructed;
+			S.EventsAttempted        += Outcome.EventsAttempted;
+			S.EventsReconstructed    += Outcome.EventsReconstructed;
+
+			const FBlueprintFidelityReport& F = Outcome.Report;
+			if (S.bVerify)
+			{
+				S.Identical += F.Identical; S.Equivalent += F.Equivalent; S.Intentional += F.Intentional;
+				S.Drift     += F.Drift;     S.Missing    += F.Missing;    S.Uncomparable += F.Uncomparable;
+				TArray<FString> Pairs;
+				F.IntentTally.ParseIntoArray(Pairs, TEXT(";"), /*CullEmpty*/ true);
+				for (const FString& P : Pairs)
+				{
+					FString Key, Val;
+					if (P.Split(TEXT("="), &Key, &Val)) { S.IntentTally.FindOrAdd(Key) += FCString::Atoi(*Val); }
+				}
+			}
+
+			if (S.bVerify)
+			{
+				// EMPTY fidelity cells when nothing was scored - a 0-function BP must never write a 1.000
+				// row into a file someone will average.
+				const FString FidCell = F.HasScore() ? FString::Printf(TEXT("%.3f"), F.Score()) : FString();
+				const FString AdjCell = F.HasScore() ? FString::Printf(TEXT("%.3f"), F.AdjustedScore()) : FString();
+				KrSweepWriteCsvLine(S, FString::Printf(TEXT("%d,%s,%s,%d,%d,%s,%d,%d,%d,%d,%d,%d,%s,%s,%s,%s,%s"),
+					S.Index, *KrCsvCell(Target.PackageName), *KrCsvCell(BpName),
+					Outcome.FunctionsAttempted, Outcome.FunctionsReconstructed,
+					bFail ? TEXT("FAIL") : TEXT("PASS"), Outcome.CompileErrors, Outcome.CompileWarnings,
+					F.Identical, F.Equivalent, F.Intentional, F.Drift, *FidCell, *AdjCell,
+					*KrCsvCell(F.IntentTally), *KrCsvCell(F.FirstDrift), *KrCsvCell(Outcome.FirstError)));
+			}
+			else
+			{
+				KrSweepWriteCsvLine(S, FString::Printf(TEXT("%d,%s,%s,%d,%d,%s,%d,%d,%s"),
+					S.Index, *KrCsvCell(Target.PackageName), *KrCsvCell(BpName),
+					Outcome.FunctionsAttempted, Outcome.FunctionsReconstructed,
+					bFail ? TEXT("FAIL") : TEXT("PASS"), Outcome.CompileErrors, Outcome.CompileWarnings,
+					*KrCsvCell(Outcome.FirstError)));
+			}
+			++S.CsvRows;
+		}
+
+		++S.Index;
+
+		// GC cadence copied from the engine harness (:1303): every 25 Blueprints, counted from the
+		// resume cursor, BETWEEN Blueprints. Never inside one - the throwaway copy is already torn down
+		// by the export at this point, but the decompiler's IR holds raw pointers while a BP is in flight.
+		if (((S.Index - S.StartIndex) % 25) == 0)
+		{
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+			++S.GcRuns;
+		}
+
+		Mutable().Result = KrSweepResultJson(S, /*bFinal*/ false);
+		SetPhase(*FString::Printf(TEXT("sweeping %d/%d"), S.Index - S.StartIndex, S.EndIndex - S.StartIndex));
+
+		if (S.Index >= S.EndIndex)
+		{
+			KrSweepFinish(S, true, FString());
+			return;
+		}
+		GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateLambda([]() { KrSweepTick(); }));
+	}
+
+	/** Shared front half of kr_drift_census and kr_batch_reconstruct: enumerate, take the slot, open the
+	 *  CSV, scope the CVars, arm the first tick. Writes the queued response into Out. */
+	static void KrStartSweep(const TSharedRef<FJsonObject>& Out, const TCHAR* Kind, const FString& PathFilter,
+		int32 StartIndex, int32 MaxCount, bool bAsChild, bool bVerify, bool bClassifyIntentional, bool bCensusCvar)
+	{
+		if (!GEditor)
+		{
+			KrFail(Out, FString::Printf(
+				TEXT("no GEditor - %s slices its work through the editor timer manager and cannot run in a commandlet"), Kind));
+			return;
+		}
+
+		TArray<FKrSweepTarget> Targets;
+		int32 AnimExcluded = 0, CorpusTotal = 0;
+		FString EnumError;
+		if (!KrEnumerateSweepTargets(PathFilter, Targets, AnimExcluded, CorpusTotal, EnumError))
+		{
+			KrFail(Out, EnumError);
+			return;
+		}
+
+		if (StartIndex > Targets.Num())
+		{
+			KrFail(Out, FString::Printf(
+				TEXT("startIndex %d is past the end of the target set (%d cooked Blueprints match pathFilter '%s')"),
+				StartIndex, Targets.Num(), *PathFilter));
+			return;
+		}
+
+		const int32 EndIndex = (MaxCount <= 0)
+			? Targets.Num()
+			: FMath::Min(Targets.Num(), StartIndex + MaxCount);
+
+		FString JobId, BeginError;
+		if (!MifKr::Jobs::TryBegin(Kind, JobId, BeginError))
+		{
+			KrFail(Out, BeginError);
+			return;
+		}
+
+		TUniquePtr<FKrSweepState> S = MakeUnique<FKrSweepState>();
+		S->JobId = JobId;
+		S->Kind = Kind;
+		S->Targets = MoveTemp(Targets);
+		S->StartIndex = StartIndex;
+		S->Index = StartIndex;
+		S->EndIndex = EndIndex;
+		S->bAsChild = bAsChild;
+		S->bVerify = bVerify;
+		S->bClassifyIntentional = bClassifyIntentional;
+		S->PathFilter = PathFilter;
+		S->AnimExcluded = AnimExcluded;
+		S->CorpusTotal = CorpusTotal;
+
+		// One CSV per JOB, named with the jobId: a partial HTTP sweep and a full console
+		// mif.kr.ReconstructAll run must never be mistaken for one another when someone finds two files
+		// in that folder a week later. Column set is the engine harness's, exactly (9 without verify,
+		// 17 with), so the two are diffable.
+		const FString ReportDir = FPaths::ProjectSavedDir() / TEXT("MifKr");
+		IFileManager::Get().MakeDirectory(*ReportDir, /*Tree*/ true);
+		S->CsvPath = ReportDir / FString::Printf(TEXT("%s_%s_%s_%s.csv"),
+			(S->Kind == TEXT("census")) ? TEXT("KrCensus") : TEXT("KrBatch"),
+			bAsChild ? TEXT("child") : TEXT("sibling"),
+			*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")), *JobId);
+		S->Csv.Reset(IFileManager::Get().CreateFileWriter(*S->CsvPath, FILEWRITE_AllowRead));
+		if (!S->Csv)
+		{
+			// Not fatal: the counters are the answer, the CSV is the forensic copy. Say so rather than
+			// failing a multi-minute job over a file handle.
+			S->CsvPath.Empty();
+		}
+		else
+		{
+			KrSweepWriteCsvLine(*S, bVerify
+				? TEXT("Index,Package,Blueprint,RealFuncs,Reconstructed,Status,Errors,Warnings,Ident,Equiv,Intent,Drift,Fidelity,AdjFidelity,IntentTally,FirstDrift,FirstError")
+				: TEXT("Index,Package,Blueprint,RealFuncs,Reconstructed,Status,Errors,Warnings,FirstError"));
+		}
+
+		S->ClassifyScope = MakeUnique<FKrScopedCVarInt>(TEXT("mif.kr.ClassifyIntentional"), bClassifyIntentional ? 1 : 0);
+		if (bCensusCvar)
+		{
+			S->CensusScope = MakeUnique<FKrScopedCVarInt>(TEXT("mif.kr.DriftCensus"), 1);
+		}
+
+		{
+			MifKr::Jobs::FJobRecord& Job = MifKr::Jobs::Mutable();
+			Job.SourceAsset = PathFilter;
+			Job.BpName = FString::Printf(TEXT("%d blueprint(s)"), EndIndex - StartIndex);
+			Job.Mode = bAsChild ? TEXT("child") : TEXT("sibling");
+			Job.TargetPath = S->CsvPath;
+			Job.FunctionsTotalEstimate = 0;   // unknowable up front across N Blueprints; the DONE counts are authoritative
+			Job.Result = KrSweepResultJson(*S, /*bFinal*/ false);
+		}
+
+		const int32 BpTotal = EndIndex - StartIndex;
+		const bool bEmpty = (BpTotal <= 0);
+		GSweep = MoveTemp(S);
+
+		Out->SetStringField(TEXT("jobId"), JobId);
+		Out->SetStringField(TEXT("kind"), Kind);
+		Out->SetStringField(TEXT("state"), TEXT("queued"));
+		Out->SetStringField(TEXT("pathFilter"), PathFilter);
+		Out->SetStringField(TEXT("mode"), bAsChild ? TEXT("child") : TEXT("sibling"));
+		Out->SetBoolField(TEXT("verify"), bVerify);
+		Out->SetBoolField(TEXT("classifyIntentional"), bClassifyIntentional);
+		Out->SetNumberField(TEXT("startIndex"), StartIndex);
+		Out->SetNumberField(TEXT("bpTotal"), BpTotal);
+		Out->SetNumberField(TEXT("matched"), GSweep->Targets.Num());
+		Out->SetNumberField(TEXT("animExcluded"), AnimExcluded);
+		Out->SetNumberField(TEXT("corpusPackages"), CorpusTotal);
+		if (!GSweep->CsvPath.IsEmpty()) { Out->SetStringField(TEXT("csvPath"), GSweep->CsvPath); }
+		Out->SetBoolField(TEXT("deferred"), true);
+		Out->SetStringField(TEXT("note"),
+			TEXT("DEFERRED and SLICED: this call did NOT do the work. One Blueprint is processed per editor tick, so ")
+			TEXT("kr_reconstruct_status genuinely advances mid-job (bpDone) - unlike the single-Blueprint kinds, which are ")
+			TEXT("atomic. There is ONE job slot and no queue. Poll kr_reconstruct_status; result.resumeHint is the ")
+			TEXT("startIndex to pass if the editor dies mid-sweep."));
+
+		if (bEmpty)
+		{
+			Out->SetStringField(TEXT("hint"), FString::Printf(
+				TEXT("zero cooked Blueprints match pathFilter '%s' at startIndex %d - pass \"*\" for every mounted root, or ")
+				TEXT("size the corpus first with kr_list_cooked_blueprints"), *PathFilter, StartIndex));
+		}
+
+		// Armed even when empty: the job must reach `done` with bpTotal:0 rather than sit queued forever.
+		GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateLambda([]() { KrSweepTick(); }));
+	}
+
+	// --- kr_verify_fidelity ------------------------------------------------------------------------
+	//   in:  { sourceAsset [REQUIRED] (aliases: blueprint, bpName, path),
+	//          classifyIntentional?: bool (default true; alias classify),
+	//          allowAnim?: bool (default false) }
+	//   out: { jobId, kind:"verify", state:"queued", sourceAsset, sourceClassPath, sourceCooked,
+	//          bpName, mode:"child", classifyIntentional, functionsTotalEstimate, deferred:true, note }
+	//   result (via kr_reconstruct_status): { fidelity{...}, stats{...}, compile{...}, invariants{...} }
+	//
+	// Reconstruct a THROWAWAY transient CHILD of the cooked class, compile it, and diff every
+	// reconstructed function's recompiled bytecode against the cooked original. Turns "it compiled" into
+	// "it provably behaves like the original", with the exact function and statement where it does not.
+	//
+	// NO `variant`/`mode` PARAMETER EXISTS, ON PURPOSE: fidelity is CHILD-ONLY. A sibling is minted into
+	// the transient package and COPIES the component tree, so every component reference differs by object
+	// path and reports systematic FALSE drift - a number that measures the mode, not the decompiler.
+	//
+	// Bucket SELF-MANAGED: the deferred slice runs a full FKismetEditorUtilities::CompileBlueprint. A full
+	// compile inside a blanket undo transaction means reinstancing captured by an undo step, i.e. a dead
+	// CDO. SelfManaged also makes the endpoint compile-heavy, fencing it out of batch's open transaction.
+	//
+	// COOKED CONTENT: cooked is the target, but a loose/authored Blueprint is deliberately ACCEPTED - that
+	// is the ground-truth loop (author a BP with the bridge, reconstruct it, diff against what you built).
+	static void H_kr_verify_fidelity(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
+	{
+		if (KrRejectUnknownParams(In, Out,
+			{ TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path"),
+			  TEXT("classifyIntentional"), TEXT("classify"), TEXT("allowAnim") },
+			TEXT("sourceAsset (aliases: blueprint, bpName, path), classifyIntentional (alias: classify), allowAnim"),
+			{{ TEXT("variant"),
+			   TEXT("does not exist here - fidelity is CHILD-ONLY: a sibling copy mints its components into the transient package, so every component reference differs by object path and reports systematic FALSE drift") },
+			 { TEXT("mode"),
+			   TEXT("does not exist here - this endpoint always mints a transient CHILD; use kr_batch_reconstruct for a sibling sweep") },
+			 { TEXT("function"),
+			   TEXT("not a filter here - kr_verify_fidelity reports the whole-Blueprint aggregate; use kr_classify_drift for per-function verdicts") },
+			 { TEXT("targetPath"),
+			   TEXT("not a parameter - nothing is saved: the copy is minted into the transient package and torn down by the engine") },
+			 { TEXT("wait"),
+			   TEXT("not implemented - the job is deferred one tick and cannot be waited on inside this request; poll kr_reconstruct_status") }}))
+		{
+			return;
+		}
+
+		if (MifKr::Jobs::IsBusy())
+		{
+			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
+			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
+			Out->SetStringField(TEXT("runningKind"), Running.Kind);
+			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
+			return;
+		}
+		if (!GEditor)
+		{
+			KrFail(Out, TEXT("no GEditor - kr_verify_fidelity defers its work through the editor timer manager and cannot run in a commandlet"));
+			return;
+		}
+
+		const FString SourceArg = KrJStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
+		if (SourceArg.IsEmpty())
+		{
+			KrFail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
+			return;
+		}
+
+		FString ResolveError;
+		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(SourceArg, ResolveError);
+		if (!BPGC) { KrFail(Out, ResolveError); return; }
+
+		const bool bAllowAnim = KrJBool(In, TEXT("allowAnim"), false);
+		if (KrIsAnimBlueprintClass(BPGC) && !bAllowAnim)
+		{
+			KrFail(Out, FString::Printf(
+				TEXT("'%s' is an Animation Blueprint and reconstruction of anim graphs is NOT implemented: the engine mints an ")
+				TEXT("anim source as a PLAIN UBlueprint (only Widget Blueprints get their own class pair), so the copy has no ")
+				TEXT("AnimGraph and every fidelity number would describe that degraded copy rather than the decompiler. ")
+				TEXT("Anim Blueprints are excluded from kr_drift_census and kr_batch_reconstruct by the same rule. ")
+				TEXT("Pass allowAnim:true to measure it anyway - the result is then flagged degraded:true."),
+				*BPGC->GetPathName()));
+			Out->SetBoolField(TEXT("animBlueprint"), true);
+			Out->SetStringField(TEXT("sourceClassPath"), BPGC->GetPathName());
+			return;
+		}
+
+		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+
+		FString BaseName = BPGC->GetName();
+		BaseName.RemoveFromEnd(TEXT("_C"));
+
+		int32 FunctionsTotalEstimate = 0;
+		for (TFieldIterator<UFunction> It(BPGC, EFieldIteratorFlags::ExcludeSuper); It; ++It)
+		{
+			UFunction* Func = *It;
+			if (!Func || Func->Script.Num() == 0) { continue; }
+			if (Func->HasAnyFunctionFlags(FUNC_UbergraphFunction)) { continue; }
+			++FunctionsTotalEstimate;
+		}
+
+		FString JobId, BeginError;
+		if (!MifKr::Jobs::TryBegin(TEXT("verify"), JobId, BeginError)) { KrFail(Out, BeginError); return; }
+
+		{
+			MifKr::Jobs::FJobRecord& Job = MifKr::Jobs::Mutable();
+			Job.SourceAsset = SourceArg;
+			Job.SourceClassPath = BPGC->GetPathName();
+			Job.BpName = BaseName;
+			Job.Mode = TEXT("child");
+			Job.FunctionsTotalEstimate = FunctionsTotalEstimate;
+		}
+
+		FKrVerifyPlan Plan;
+		Plan.JobId = JobId;
+		Plan.Kind = TEXT("verify");
+		Plan.SourceClassPath = BPGC->GetPathName();
+		Plan.SourceAsset = SourceArg;
+		Plan.BpName = BaseName;
+		Plan.bClassifyIntentional = bClassify;
+		Plan.bPerFunction = false;
+		Plan.bAnimAllowed = bAllowAnim;
+
+		GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateLambda([Plan]()
+		{
+			KrRunVerifyJob(Plan);
+		}));
+
+		Out->SetStringField(TEXT("jobId"), JobId);
+		Out->SetStringField(TEXT("kind"), TEXT("verify"));
+		Out->SetStringField(TEXT("state"), TEXT("queued"));
+		Out->SetStringField(TEXT("sourceAsset"), SourceArg);
+		Out->SetStringField(TEXT("sourceClassPath"), BPGC->GetPathName());
+		Out->SetBoolField(TEXT("sourceCooked"), KrIsCooked(BPGC));
+		Out->SetStringField(TEXT("bpName"), BaseName);
+		Out->SetStringField(TEXT("mode"), TEXT("child"));
+		Out->SetBoolField(TEXT("classifyIntentional"), bClassify);
+		Out->SetNumberField(TEXT("functionsTotalEstimate"), FunctionsTotalEstimate);
+		Out->SetBoolField(TEXT("deferred"), true);
+		Out->SetStringField(TEXT("note"),
+			TEXT("DEFERRED one tick and ATOMIC - this call did NOT do the work, and the job runs to completion inside a ")
+			TEXT("single tick during which the HTTP listener (a game-thread ticker) is stalled, so a poll issued mid-job is ")
+			TEXT("not read until the job ends. Poll kr_reconstruct_status. result.fidelity.score is null (never 1.000) when ")
+			TEXT("nothing was scored, and the whole fidelity block is ABSENT when the copy failed to compile."));
+	}
+
+	// --- kr_classify_drift -------------------------------------------------------------------------
+	//   in:  { sourceAsset [REQUIRED] (aliases: blueprint, bpName, path),
+	//          function?: exact own-function name to report (aliases: functionName, func),
+	//          classifyIntentional?: bool (default true; alias classify), allowAnim?: bool }
+	//   out: as kr_verify_fidelity, kind:"classify"
+	//   result: kr_verify_fidelity's payload PLUS functions[{name, verdict, reasons[], detail}],
+	//           verdictCounts{}, reasonTally, consistent
+	//
+	// The drill-down kr_verify_fidelity's aggregate cannot give: a verdict PER FUNCTION, with the
+	// classifier's claim reasons and - for real drift - the ROOT-CAUSE edit rather than the first raw
+	// stream difference (one inserted statement re-ordinalises every later jump, so the first raw
+	// difference is usually a cascade artefact).
+	//
+	// `function` FILTERS THE REPORT, it does not narrow the work: the pipeline is per-Blueprint, so the
+	// whole verify runs regardless. Saying so matters - a caller who believes it scoped the run would
+	// mis-read the timing.
+	//
+	// Bucket SELF-MANAGED (same full compile as kr_verify_fidelity).
+	static void H_kr_classify_drift(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
+	{
+		if (KrRejectUnknownParams(In, Out,
+			{ TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path"),
+			  TEXT("function"), TEXT("functionName"), TEXT("func"),
+			  TEXT("classifyIntentional"), TEXT("classify"), TEXT("allowAnim") },
+			TEXT("sourceAsset (aliases: blueprint, bpName, path), function (aliases: functionName, func), ")
+			TEXT("classifyIntentional (alias: classify), allowAnim"),
+			{{ TEXT("includeWindow"),
+			   TEXT("not implemented - the +/-2 statement window needs the verifier's canonical cooked/recon streams, which exist only inside its own per-function loop and never cross the delegate boundary; disassemble the named function with kr_disassemble_function instead") },
+			 { TEXT("window"),
+			   TEXT("not implemented - same reason as includeWindow; use kr_disassemble_function on the function named in detail") },
+			 { TEXT("variant"),
+			   TEXT("does not exist here - classification is CHILD-ONLY for the same reason fidelity is: a sibling copy false-drifts on every component reference") }}))
+		{
+			return;
+		}
+
+		if (MifKr::Jobs::IsBusy())
+		{
+			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
+			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
+			Out->SetStringField(TEXT("runningKind"), Running.Kind);
+			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
+			return;
+		}
+		if (!GEditor)
+		{
+			KrFail(Out, TEXT("no GEditor - kr_classify_drift defers its work through the editor timer manager and cannot run in a commandlet"));
+			return;
+		}
+
+		const FString SourceArg = KrJStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
+		if (SourceArg.IsEmpty())
+		{
+			KrFail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
+			return;
+		}
+
+		FString ResolveError;
+		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(SourceArg, ResolveError);
+		if (!BPGC) { KrFail(Out, ResolveError); return; }
+
+		const bool bAllowAnim = KrJBool(In, TEXT("allowAnim"), false);
+		if (KrIsAnimBlueprintClass(BPGC) && !bAllowAnim)
+		{
+			KrFail(Out, FString::Printf(
+				TEXT("'%s' is an Animation Blueprint: the engine mints an anim source as a PLAIN UBlueprint, so the copy has ")
+				TEXT("no AnimGraph and per-function verdicts would describe a degraded copy, not the decompiler. ")
+				TEXT("Pass allowAnim:true to classify it anyway - the result is then flagged degraded:true."),
+				*BPGC->GetPathName()));
+			Out->SetBoolField(TEXT("animBlueprint"), true);
+			Out->SetStringField(TEXT("sourceClassPath"), BPGC->GetPathName());
+			return;
+		}
+
+		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+		const FString FunctionFilter = KrJStrAny(In, { TEXT("function"), TEXT("functionName"), TEXT("func") });
+
+		FString BaseName = BPGC->GetName();
+		BaseName.RemoveFromEnd(TEXT("_C"));
+
+		int32 FunctionsTotalEstimate = 0;
+		for (TFieldIterator<UFunction> It(BPGC, EFieldIteratorFlags::ExcludeSuper); It; ++It)
+		{
+			UFunction* Func = *It;
+			if (!Func || Func->Script.Num() == 0) { continue; }
+			if (Func->HasAnyFunctionFlags(FUNC_UbergraphFunction)) { continue; }
+			++FunctionsTotalEstimate;
+		}
+
+		FString JobId, BeginError;
+		if (!MifKr::Jobs::TryBegin(TEXT("classify"), JobId, BeginError)) { KrFail(Out, BeginError); return; }
+
+		{
+			MifKr::Jobs::FJobRecord& Job = MifKr::Jobs::Mutable();
+			Job.SourceAsset = SourceArg;
+			Job.SourceClassPath = BPGC->GetPathName();
+			Job.BpName = BaseName;
+			Job.Mode = TEXT("child");
+			Job.FunctionName = FunctionFilter;
+			Job.FunctionsTotalEstimate = FunctionsTotalEstimate;
+		}
+
+		FKrVerifyPlan Plan;
+		Plan.JobId = JobId;
+		Plan.Kind = TEXT("classify");
+		Plan.SourceClassPath = BPGC->GetPathName();
+		Plan.SourceAsset = SourceArg;
+		Plan.BpName = BaseName;
+		Plan.bClassifyIntentional = bClassify;
+		Plan.bPerFunction = true;
+		Plan.bAnimAllowed = bAllowAnim;
+		Plan.FunctionFilter = FunctionFilter;
+
+		GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateLambda([Plan]()
+		{
+			KrRunVerifyJob(Plan);
+		}));
+
+		Out->SetStringField(TEXT("jobId"), JobId);
+		Out->SetStringField(TEXT("kind"), TEXT("classify"));
+		Out->SetStringField(TEXT("state"), TEXT("queued"));
+		Out->SetStringField(TEXT("sourceAsset"), SourceArg);
+		Out->SetStringField(TEXT("sourceClassPath"), BPGC->GetPathName());
+		Out->SetBoolField(TEXT("sourceCooked"), KrIsCooked(BPGC));
+		Out->SetStringField(TEXT("bpName"), BaseName);
+		Out->SetStringField(TEXT("mode"), TEXT("child"));
+		Out->SetBoolField(TEXT("classifyIntentional"), bClassify);
+		if (!FunctionFilter.IsEmpty()) { Out->SetStringField(TEXT("function"), FunctionFilter); }
+		Out->SetNumberField(TEXT("functionsTotalEstimate"), FunctionsTotalEstimate);
+		Out->SetBoolField(TEXT("deferred"), true);
+		Out->SetStringField(TEXT("note"),
+			TEXT("DEFERRED one tick and ATOMIC - poll kr_reconstruct_status. `function` filters the REPORT only: the ")
+			TEXT("whole-Blueprint verify still runs, because the pipeline is per-Blueprint. This kind costs roughly TWICE ")
+			TEXT("kr_verify_fidelity: the verifier runs once for the aggregate and once per function, which is what makes ")
+			TEXT("result.consistent an independent cross-check rather than a tautology."));
+	}
+
+	// --- kr_drift_census ---------------------------------------------------------------------------
+	//   in:  { pathFilter?: substring over package names, "*" = all (aliases: filter, pathSubstr; default "/Game/"),
+	//          startIndex?: int >= 0 (default 0; crash-resume cursor),
+	//          maxCount?: int (default 50, 0 = unbounded; aliases: limit),
+	//          classifyIntentional?: bool (default true; alias classify) }
+	//   out: { jobId, kind:"census", state:"queued", pathFilter, bpTotal, matched, animExcluded, csvPath, ... }
+	//   result: { filter{}, bpTotal, bpDone, pass, fail, skip, skipTaxonomy{resolve,parent,mint},
+	//             totals{}, corpusFidelity|null, corpusAdjusted|null, intentTally, censusCsvPath,
+	//             corpusBaseline{}, resumeHint, ... }
+	//
+	// The fidelity verify across a path-filtered SET of cooked Blueprints with the classifier's census
+	// instrument (mif.kr.DriftCensus) forced on for the job's duration, producing running corpus totals
+	// over HTTP plus the on-disk DriftCensus CSV of every UNCLAIMED drift edit - the data a rule author
+	// needs to decide which drift classes actually dominate, without babysitting a console for an hour.
+	//
+	// CHILD MODE ALWAYS, VERIFY ALWAYS: a census that measured siblings would report the mode, not the
+	// decompiler. maxCount defaults to 50 because an accidental whole-corpus run must be opt-in
+	// (maxCount:0 asks for it explicitly).
+	//
+	// COOKED-ONLY BY DESIGN: loose Blueprints are exactly what a corpus fidelity number must not dilute.
+	// Bucket SELF-MANAGED: it compiles one throwaway Blueprint per slice.
+	static void H_kr_drift_census(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
+	{
+		if (KrRejectUnknownParams(In, Out,
+			{ TEXT("pathFilter"), TEXT("filter"), TEXT("pathSubstr"), TEXT("startIndex"), TEXT("start"),
+			  TEXT("maxCount"), TEXT("limit"), TEXT("classifyIntentional"), TEXT("classify") },
+			TEXT("pathFilter (aliases: filter, pathSubstr), startIndex (alias: start), maxCount (alias: limit), ")
+			TEXT("classifyIntentional (alias: classify)"),
+			{{ TEXT("mode"),
+			   TEXT("not a parameter - a census is CHILD-ONLY: a sibling copy false-drifts on every component reference, so a sibling census would measure the mode instead of the decompiler. Use kr_batch_reconstruct for a sibling sweep") },
+			 { TEXT("verify"),
+			   TEXT("not a parameter - verification IS the census; use kr_batch_reconstruct for a pass/fail-only sweep") },
+			 { TEXT("cookedOnly"),
+			   TEXT("not a parameter - a census is cooked-only by design: loose Blueprints are exactly what a corpus fidelity number must not dilute") },
+			 { TEXT("wait"),
+			   TEXT("not implemented - the sweep is sliced one Blueprint per tick; poll kr_reconstruct_status") }}))
+		{
+			return;
+		}
+
+		if (MifKr::Jobs::IsBusy())
+		{
+			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
+			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
+			Out->SetStringField(TEXT("runningKind"), Running.Kind);
+			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
+			return;
+		}
+
+		const FString PathFilter = KrJStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathSubstr") }, TEXT("/Game/"));
+		const int32 StartIndex = KrJIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
+		const int32 MaxCount = KrJIntAny(In, { TEXT("maxCount"), TEXT("limit") }, 50);
+		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+
+		if (StartIndex < 0)
+		{
+			KrFail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
+			return;
+		}
+		if (MaxCount < 0)
+		{
+			KrFail(Out, FString::Printf(TEXT("maxCount %d is invalid; pass a positive count, or 0 for the whole filtered corpus"), MaxCount));
+			return;
+		}
+
+		KrStartSweep(Out, TEXT("census"), PathFilter, StartIndex, MaxCount,
+			/*bAsChild*/ true, /*bVerify*/ true, bClassify, /*bCensusCvar*/ true);
+	}
+
+	// --- kr_batch_reconstruct ----------------------------------------------------------------------
+	//   in:  { pathFilter?: substring, "*" = all (aliases: filter, pathContains; default "/Game/"),
+	//          mode?: "sibling" | "child" (alias variant; default "sibling"),
+	//          verify?: bool (default false; REQUIRES mode:"child"),
+	//          startIndex?: int >= 0 (default 0),
+	//          maxBlueprints?: int (default 0 = every match; alias limit) }
+	//   out: { jobId, kind:"batch", state:"queued", ... }
+	//   result: { bpTotal, bpDone, pass, fail, skip, skipTaxonomy{}, csvPath, csvRows, ... }
+	//
+	// The regression sweep: reconstruct every matching cooked Blueprint into a throwaway copy, compile
+	// it, tally PASS/FAIL/SKIP, and write the engine harness's exact CSV. This is mif.kr.ReconstructAll
+	// over HTTP - except the console command blocks the editor for the entire run, and this one slices
+	// one Blueprint per tick so the bridge keeps answering and the progress is observable.
+	//
+	// Bucket SELF-MANAGED: one full compile per slice.
+	// COOKED: the target set IS the cooked corpus - the same exact-class-path gate that drives F3.
+	static void H_kr_batch_reconstruct(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
+	{
+		if (KrRejectUnknownParams(In, Out,
+			{ TEXT("pathFilter"), TEXT("filter"), TEXT("pathContains"), TEXT("mode"), TEXT("variant"),
+			  TEXT("verify"), TEXT("startIndex"), TEXT("start"), TEXT("maxBlueprints"), TEXT("limit"),
+			  TEXT("classifyIntentional"), TEXT("classify") },
+			TEXT("pathFilter (aliases: filter, pathContains), mode (alias: variant), verify, ")
+			TEXT("startIndex (alias: start), maxBlueprints (alias: limit), classifyIntentional (alias: classify)"),
+			{{ TEXT("save"),
+			   TEXT("not a parameter - a batch sweep NEVER saves: every copy is minted into the transient package and torn down. Use kr_reconstruct_request mode:'copy' to produce a persistent asset") },
+			 { TEXT("targetPath"),
+			   TEXT("not a parameter - nothing is written except the CSV report under <ProjectSaved>/MifKr/") },
+			 { TEXT("wait"),
+			   TEXT("not implemented - the sweep is sliced one Blueprint per tick; poll kr_reconstruct_status") }}))
+		{
+			return;
+		}
+
+		if (MifKr::Jobs::IsBusy())
+		{
+			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
+			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
+			Out->SetStringField(TEXT("runningKind"), Running.Kind);
+			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
+			return;
+		}
+
+		const FString PathFilter = KrJStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathContains") }, TEXT("/Game/"));
+		const FString ModeArg = KrJStrAny(In, { TEXT("mode"), TEXT("variant") }, TEXT("sibling")).ToLower();
+		const bool bVerify = KrJBool(In, TEXT("verify"), false);
+		const int32 StartIndex = KrJIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
+		const int32 MaxBlueprints = KrJIntAny(In, { TEXT("maxBlueprints"), TEXT("limit") }, 0);
+		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+
+		bool bAsChild = false;
+		if (ModeArg == TEXT("child"))                                        { bAsChild = true; }
+		else if (ModeArg == TEXT("sibling") || ModeArg == TEXT("uncooked"))  { bAsChild = false; }
+		else
+		{
+			KrFail(Out, FString::Printf(
+				TEXT("mode '%s' is not recognised; pass 'sibling' (parent-class copy, the default and what the console sweep does) ")
+				TEXT("or 'child' (IS-A the cooked class, the only mode fidelity is measurable in)"), *ModeArg));
+			return;
+		}
+
+		if (bVerify && !bAsChild)
+		{
+			// The engine harness refuses the same combination for the same reason, and refusing loudly is
+			// the whole point: a sibling sweep with verify on would emit systematic FALSE drift on every
+			// Blueprint and look like a decompiler regression.
+			KrFail(Out, TEXT("verify requires mode:'child' - a SIBLING copy mints its components into the transient package, so ")
+				TEXT("every component reference differs by object path and the drift would be an artefact of the mode, not of the ")
+				TEXT("decompiler. Re-run with mode:'child', or drop verify for a pass/fail-only sweep."));
+			return;
+		}
+		if (StartIndex < 0)
+		{
+			KrFail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
+			return;
+		}
+		if (MaxBlueprints < 0)
+		{
+			KrFail(Out, FString::Printf(TEXT("maxBlueprints %d is invalid; pass a positive count, or 0 for every match"), MaxBlueprints));
+			return;
+		}
+
+		KrStartSweep(Out, TEXT("batch"), PathFilter, StartIndex, MaxBlueprints,
+			bAsChild, bVerify, bClassify, /*bCensusCvar*/ false);
 	}
 }
 
@@ -2437,6 +4151,28 @@ void MifKr_RegisterBridgeEndpoints()
 	Reg(TEXT("kr_reconstruct_status"), EEndpointBucket::ReadOnly,
 		TEXT("Poll the single kr job slot: state, phase, function/event tallies, node and compile counts, and the result payload."),
 		&H_kr_reconstruct_status);
+
+	// Wave 3. All four are SELF-MANAGED for one reason: every one of them runs a full
+	// FKismetEditorUtilities::CompileBlueprint on a throwaway transient copy (once, or once per slice).
+	// A full compile inside a blanket undo transaction means reinstancing captured by an undo step, i.e.
+	// a dead CDO and a crash. SelfManaged also makes them compile-heavy, which fences them out of
+	// batch's single open transaction for free. They mutate NO persistent state — nothing is saved,
+	// registered with the AssetRegistry, or opened — but "read-only" would be a lie about the compile.
+	Reg(TEXT("kr_verify_fidelity"), EEndpointBucket::SelfManaged,
+		TEXT("Reconstruct a throwaway transient CHILD of a cooked Blueprint, compile it, and diff every reconstructed function's recompiled bytecode against the cooked original. Deferred one tick; poll kr_reconstruct_status."),
+		&H_kr_verify_fidelity);
+
+	Reg(TEXT("kr_classify_drift"), EEndpointBucket::SelfManaged,
+		TEXT("kr_verify_fidelity decomposed PER FUNCTION: identical/equivalent/intentional/drift/missing/uncomparable per function, the classifier's claim reasons, and the root-cause edit for real drift."),
+		&H_kr_classify_drift);
+
+	Reg(TEXT("kr_drift_census"), EEndpointBucket::SelfManaged,
+		TEXT("Fidelity verify across a path-filtered set of cooked Blueprints with the drift-census instrument on: running corpus totals plus the on-disk CSV of every unclaimed drift edit. Sliced ONE Blueprint per tick."),
+		&H_kr_drift_census);
+
+	Reg(TEXT("kr_batch_reconstruct"), EEndpointBucket::SelfManaged,
+		TEXT("Reconstruct every matching cooked Blueprint into a throwaway copy, compile, tally PASS/FAIL/SKIP with the three-way skip taxonomy and the engine harness's CSV. Sliced ONE Blueprint per tick."),
+		&H_kr_batch_reconstruct);
 
 	UE_LOG(LogMifKismetReconstructor, Log, TEXT("registered %d kr_* MifBridge endpoint(s)."), Registered);
 }
