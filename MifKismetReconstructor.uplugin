@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "0.1",
+	"Version": 2,
+	"VersionName": "0.2.0",
 	"FriendlyName": "Mif Kismet Reconstructor",
-	"Description": "Reconstructs editable K2 Blueprint graphs from cooked Kismet bytecode (Phase 0: in-editor disassembler + JSON dumper).",
+	"Description": "Reconstructs editable K2 Blueprint graphs from cooked Kismet bytecode. Disassembly, reconstruction, per-function bytecode fidelity verification and corpus drift sweeps, exposed over MifBridge as 12 kr_* endpoints.",
 	"Category": "Editor",
 	"CreatedBy": "Mif",
 	"CanContainContent": false,
