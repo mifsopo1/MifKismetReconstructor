@@ -57,7 +57,8 @@
 
 #if WITH_MIFBRIDGE
 
-#include "MifBridgeEndpointRegistry.h"   // MifBridge/Public — the ONLY MifBridge header reachable here
+#include "MifBridgeEndpointRegistry.h"   // MifBridge/Public - endpoint registration
+#include "MifBridgeParams.h"             // MifBridge/Public — the parameter contract, shared not mirrored
 
 // In-module Private headers. Every symbol reached through these was checked for BOTH internal linkage
 // and the MIF_KR_DEBUG gate (K_IMPL_PLAN.md §A.3 table): all are ungated with external linkage, which
@@ -71,7 +72,7 @@
 #include "CompiledBlueprintReconstructor.h"           // KISMET_API CreateEditableBlueprintCopy (engine fork)
 
 #include "CoreMinimal.h"
-#include <initializer_list>              // KrRejectUnknownParams' accepted-key list (mirrors MifBridge)
+#include <initializer_list>              // RejectUnknownParams' accepted-key list (mirrors MifBridge)
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "EdGraph/EdGraph.h"
@@ -107,113 +108,42 @@ namespace MifKr::BridgeEndpoints
 {
 	static const TCHAR* GProvider = TEXT("MifKismetReconstructor");
 
-	// --- Local mirrors of MifBridge's private handler helpers (see the file header) --------------
-
-	static void KrFail(const TSharedRef<FJsonObject>& Out, const FString& Message)
-	{
-		Out->SetBoolField(TEXT("ok"), false);
-		Out->SetStringField(TEXT("error"), Message);
-	}
-
-	/** Mirror of MifBridge::RejectUnknownParams (MifBridgeHandlers.h:65-67). Fails Out (and returns
-	 *  true) naming EVERY key in In that is not accepted, and listing the accepted set. An IGNORED
-	 *  parameter is worse than a rejected one — the caller gets ok:true and debugs the wrong
-	 *  subsystem. Matching is case-INSENSITIVE, exactly as the bridge's JSON accessors find fields,
-	 *  so a key that WOULD be honoured is never rejected. KeyNotes explains a specific unknown key
-	 *  where "unrecognised" alone would mislead (an unimplemented capability, not a typo). */
-	static bool KrRejectUnknownParams(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out,
-		std::initializer_list<const TCHAR*> AcceptedKeys, const TCHAR* AcceptedSummary,
-		std::initializer_list<TPair<const TCHAR*, const TCHAR*>> KeyNotes = {})
-	{
-		TArray<FString> Unrecognised;
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : In->Values)
-		{
-			// 'op' is the BATCH DISPATCHER's routing key, not a handler parameter: H_batch passes each op
-			// object to the handler VERBATIM, 'op' field included. MifBridge tolerates it centrally in
-			// its own RejectUnknownParams so no call site has to remember it; this mirror must do the
-			// same or every ReadOnly kr_* endpoint fails with "unrecognised parameter 'op'" the moment it
-			// is called inside batch — strictness silently breaking composition, the exact regression
-			// MifBridge already had and fixed (06_IMPLEMENTED.md, "Batch E + `op` regression").
-			if (Pair.Key.Equals(TEXT("op"), ESearchCase::IgnoreCase))
-			{
-				continue;
-			}
-
-			bool bKnown = false;
-			for (const TCHAR* Key : AcceptedKeys)
-			{
-				if (Pair.Key.Equals(Key, ESearchCase::IgnoreCase)) { bKnown = true; break; }
-			}
-			if (bKnown)
-			{
-				continue;
-			}
-			const TCHAR* Note = nullptr;
-			for (const TPair<const TCHAR*, const TCHAR*>& KeyNote : KeyNotes)
-			{
-				if (Pair.Key.Equals(KeyNote.Key, ESearchCase::IgnoreCase)) { Note = KeyNote.Value; break; }
-			}
-			Unrecognised.Add(Note
-				? FString::Printf(TEXT("'%s' (%s)"), *Pair.Key, Note)
-				: FString::Printf(TEXT("'%s'"), *Pair.Key));
-		}
-		if (Unrecognised.Num() == 0)
-		{
-			return false;
-		}
-		KrFail(Out, FString::Printf(TEXT("unrecognised parameter%s %s - accepted: %s"),
-			Unrecognised.Num() == 1 ? TEXT("") : TEXT("s"),
-			*FString::Join(Unrecognised, TEXT(", ")), AcceptedSummary));
-		return true;
-	}
-
-	/** First non-empty of several accepted spellings (mirror of MifBridge::JStrAny). */
-	static FString KrJStrAny(const TSharedRef<FJsonObject>& In, std::initializer_list<const TCHAR*> Fields,
-		const FString& Default = FString())
-	{
-		for (const TCHAR* Field : Fields)
-		{
-			FString Value;
-			if (In->TryGetStringField(Field, Value) && !Value.IsEmpty()) { return Value; }
-		}
-		return Default;
-	}
-
-	static bool KrJBool(const TSharedRef<FJsonObject>& In, const TCHAR* Field, bool Default)
-	{
-		bool Value = Default;
-		return In->TryGetBoolField(Field, Value) ? Value : Default;
-	}
-
-	/** First PRESENT of several accepted spellings, for BOOL params with aliases
-	 *  (classifyIntentional/classify). "First present", not "first true": a caller who passes
-	 *  classify:false must get false, and a value-based fold would silently return the default. */
-	static bool KrJBoolAny(const TSharedRef<FJsonObject>& In, std::initializer_list<const TCHAR*> Fields, bool Default)
-	{
-		for (const TCHAR* Field : Fields)
-		{
-			bool Value = Default;
-			if (In->TryGetBoolField(Field, Value)) { return Value; }
-		}
-		return Default;
-	}
-
-	static int32 KrJInt(const TSharedRef<FJsonObject>& In, const TCHAR* Field, int32 Default)
-	{
-		int32 Value = Default;
-		return In->TryGetNumberField(Field, Value) ? Value : Default;
-	}
-
-	/** First present of several accepted spellings, for INT params with aliases (offset/statementOffset). */
-	static int32 KrJIntAny(const TSharedRef<FJsonObject>& In, std::initializer_list<const TCHAR*> Fields, int32 Default)
-	{
-		for (const TCHAR* Field : Fields)
-		{
-			int32 Value = Default;
-			if (In->TryGetNumberField(Field, Value)) { return Value; }
-		}
-		return Default;
-	}
+	// --- MifBridge's parameter helpers, called rather than mirrored ------------------------------
+	//
+	// These were local copies until 2026-08-31, because the originals were declared in MifBridge's
+	// PRIVATE handler header and could not be reached from here. They are now in
+	// Public/MifBridgeParams.h and the copies are gone - extracting a shared helper only helps once
+	// the copies are deleted, and keeping both would have been worse than either.
+	//
+	// TWO OF THE COPIES HAD DRIFTED, silently, in the direction that answers ok:true:
+	//
+	//   JBool used TryGetBoolField and JInt used TryGetNumberField. Both succeed ONLY for that
+	//   exact JSON type. MifBridge's JBool also accepts 0/1 and the true/yes/on/1 spellings, and
+	//   reports anything else as a parameter type violation instead of answering the default. So
+	//   {"cookedOnly":"false"} kept its `true` default and reported success - across 13 bool
+	//   parameters, most of which default TRUE, so the silent direction was "you asked to exclude
+	//   something and got it anyway". The same client on the same port got lenient parsing from
+	//   mif_* endpoints and strict-silent parsing from these.
+	//
+	// JBoolAny's own comment shows how close this came to being caught: it reasoned carefully that
+	// "first present, not first true" is needed so `classify:false` is honoured - which is right, and
+	// which {"classify":"false"} then defeated anyway, one type across.
+	//
+	// Deferred work must go through MifBridge::MifDeferToNextTick for the same reason: a TGuardValue
+	// restores on scope exit, so a lambda scheduled for a later tick runs with the unattended-script
+	// backstop already unwound, and a modal raised there stops the bridge answering while the editor
+	// still looks alive.
+	using MifBridge::Fail;
+	using MifBridge::IsOk;
+	using MifBridge::JStr;
+	using MifBridge::JStrAny;
+	using MifBridge::JBool;
+	using MifBridge::JBoolAny;
+	using MifBridge::JInt;
+	using MifBridge::JIntAny;
+	using MifBridge::JHasAny;
+	using MifBridge::RejectUnknownParams;
+	using MifBridge::MifDeferToNextTick;
 
 	// --- Shared validation ------------------------------------------------------------------------
 
@@ -225,17 +155,17 @@ namespace MifKr::BridgeEndpoints
 	{
 		if (Offset < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("%s %d is invalid; pass 0 or greater"), OffsetName, Offset));
+			Fail(Out, FString::Printf(TEXT("%s %d is invalid; pass 0 or greater"), OffsetName, Offset));
 			return true;
 		}
 		if (Limit < 1)
 		{
-			KrFail(Out, FString::Printf(TEXT("%s %d is invalid; pass 1..%d"), LimitName, Limit, MaxLimit));
+			Fail(Out, FString::Printf(TEXT("%s %d is invalid; pass 1..%d"), LimitName, Limit, MaxLimit));
 			return true;
 		}
 		if (Limit > MaxLimit)
 		{
-			KrFail(Out, FString::Printf(TEXT("%s %d exceeds maximum %d; page with %s"), LimitName, Limit, MaxLimit, OffsetName));
+			Fail(Out, FString::Printf(TEXT("%s %d exceeds maximum %d; page with %s"), LimitName, Limit, MaxLimit, OffsetName));
 			return true;
 		}
 		return false;
@@ -378,17 +308,17 @@ namespace MifKr::BridgeEndpoints
 	static UBlueprintGeneratedClass* KrResolveBPGCStrict(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out,
 		std::initializer_list<const TCHAR*> Fields, const TCHAR* ParamName)
 	{
-		const FString Arg = KrJStrAny(In, Fields);
+		const FString Arg = JStrAny(In, Fields);
 		if (Arg.IsEmpty())
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("%s required (the cooked Blueprint: its objectPath, ideally the .<Name>_C class path, e.g. ")
 				TEXT("/Game/Animations/AnimClasses/NPC/PrisonerAnimBP.PrisonerAnimBP_C)"), ParamName));
 			return nullptr;
 		}
 		FString Error;
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(Arg, Error);
-		if (!BPGC) { KrFail(Out, Error); }
+		if (!BPGC) { Fail(Out, Error); }
 		return BPGC;
 	}
 
@@ -640,7 +570,7 @@ namespace MifKr::BridgeEndpoints
 	// cannot run a construction script, and is safe to page over the whole project.
 	static void H_kr_list_cooked_blueprints(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("pathContains"), TEXT("pathFilter"), TEXT("path"), TEXT("cookedOnly"),
 			  TEXT("includeWidgets"), TEXT("offset"), TEXT("limit") },
 			TEXT("pathContains (aliases: pathFilter, path), cookedOnly, includeWidgets, offset, limit"),
@@ -652,28 +582,28 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 
-		const FString PathContains = KrJStrAny(In, { TEXT("pathContains"), TEXT("pathFilter"), TEXT("path") }, TEXT("/Game/"));
-		const bool bCookedOnly = KrJBool(In, TEXT("cookedOnly"), true);
-		const bool bIncludeWidgets = KrJBool(In, TEXT("includeWidgets"), true);
-		const int32 Offset = KrJInt(In, TEXT("offset"), 0);
-		const int32 Limit = KrJInt(In, TEXT("limit"), 200);
+		const FString PathContains = JStrAny(In, { TEXT("pathContains"), TEXT("pathFilter"), TEXT("path") }, TEXT("/Game/"));
+		const bool bCookedOnly = JBool(In, TEXT("cookedOnly"), true);
+		const bool bIncludeWidgets = JBool(In, TEXT("includeWidgets"), true);
+		const int32 Offset = JInt(In, TEXT("offset"), 0);
+		const int32 Limit = JInt(In, TEXT("limit"), 200);
 		const bool bAllPaths = (PathContains == TEXT("*"));
 
 		// Explicit refusals rather than silent clamping: a caller who asked for 5000 rows and got 2000
 		// with no page cursor would under-report the corpus and never know.
 		if (Limit < 1)
 		{
-			KrFail(Out, FString::Printf(TEXT("limit %d is invalid; pass 1..2000"), Limit));
+			Fail(Out, FString::Printf(TEXT("limit %d is invalid; pass 1..2000"), Limit));
 			return;
 		}
 		if (Limit > 2000)
 		{
-			KrFail(Out, FString::Printf(TEXT("limit %d exceeds maximum 2000; page with offset"), Limit));
+			Fail(Out, FString::Printf(TEXT("limit %d exceeds maximum 2000; page with offset"), Limit));
 			return;
 		}
 		if (Offset < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("offset %d is invalid; pass 0 or greater"), Offset));
+			Fail(Out, FString::Printf(TEXT("offset %d is invalid; pass 0 or greater"), Offset));
 			return;
 		}
 
@@ -682,7 +612,7 @@ namespace MifKr::BridgeEndpoints
 		{
 			// A partial index would report a smaller corpus with ok:true — the exact silent-wrong-answer
 			// class this bridge refuses. Say so instead (IAssetRegistry.h:719).
-			KrFail(Out, TEXT("asset registry still scanning; retry after the initial scan completes"));
+			Fail(Out, TEXT("asset registry still scanning; retry after the initial scan completes"));
 			return;
 		}
 
@@ -814,7 +744,7 @@ namespace MifKr::BridgeEndpoints
 	// Resolution LOADS the package (unlike kr_list_cooked_blueprints, which loads nothing).
 	static void H_kr_dump_blueprint(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("asset"), TEXT("sourceAsset"), TEXT("path"), TEXT("functionFilter"), TEXT("function"),
 			  TEXT("includeBytecode"), TEXT("includeStatements"), TEXT("maxStatementsPerFunction"),
 			  TEXT("includeHistogram"), TEXT("includeProperties"), TEXT("includeEvents"),
@@ -833,19 +763,19 @@ namespace MifKr::BridgeEndpoints
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGCStrict(In, Out, { TEXT("asset"), TEXT("sourceAsset"), TEXT("path") }, TEXT("asset"));
 		if (!BPGC) { return; }
 
-		const FString FunctionFilter = KrJStrAny(In, { TEXT("functionFilter"), TEXT("function") });
-		const bool bIncludeBytecode = KrJBool(In, TEXT("includeBytecode"), KrJBool(In, TEXT("includeStatements"), false));
-		const int32 MaxStatements = KrJInt(In, TEXT("maxStatementsPerFunction"), 500);
-		const bool bIncludeHistogram = KrJBool(In, TEXT("includeHistogram"), true);
-		const bool bIncludeProperties = KrJBool(In, TEXT("includeProperties"), true);
-		const bool bIncludeEvents = KrJBool(In, TEXT("includeEvents"), true);
-		const int32 Offset = KrJInt(In, TEXT("offset"), 0);
-		const int32 Limit = KrJInt(In, TEXT("limit"), 100);
+		const FString FunctionFilter = JStrAny(In, { TEXT("functionFilter"), TEXT("function") });
+		const bool bIncludeBytecode = JBool(In, TEXT("includeBytecode"), JBool(In, TEXT("includeStatements"), false));
+		const int32 MaxStatements = JInt(In, TEXT("maxStatementsPerFunction"), 500);
+		const bool bIncludeHistogram = JBool(In, TEXT("includeHistogram"), true);
+		const bool bIncludeProperties = JBool(In, TEXT("includeProperties"), true);
+		const bool bIncludeEvents = JBool(In, TEXT("includeEvents"), true);
+		const int32 Offset = JInt(In, TEXT("offset"), 0);
+		const int32 Limit = JInt(In, TEXT("limit"), 100);
 
 		if (KrRejectPaging(Out, Offset, Limit, 500, TEXT("offset"), TEXT("limit"))) { return; }
 		if (MaxStatements < 1 || MaxStatements > 5000)
 		{
-			KrFail(Out, FString::Printf(TEXT("maxStatementsPerFunction %d is invalid; pass 1..5000"), MaxStatements));
+			Fail(Out, FString::Printf(TEXT("maxStatementsPerFunction %d is invalid; pass 1..5000"), MaxStatements));
 			return;
 		}
 
@@ -1113,7 +1043,7 @@ namespace MifKr::BridgeEndpoints
 	// looks wrong. Resolution LOADS the package.
 	static void H_kr_disassemble_function(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("asset"), TEXT("sourceAsset"), TEXT("path"), TEXT("function"), TEXT("functionName"),
 			  TEXT("statementOffset"), TEXT("offset"), TEXT("statementLimit"), TEXT("limit"), TEXT("includeRaw") },
 			TEXT("asset (aliases: sourceAsset, path), function (alias: functionName), statementOffset ")
@@ -1129,16 +1059,16 @@ namespace MifKr::BridgeEndpoints
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGCStrict(In, Out, { TEXT("asset"), TEXT("sourceAsset"), TEXT("path") }, TEXT("asset"));
 		if (!BPGC) { return; }
 
-		const FString FunctionName = KrJStrAny(In, { TEXT("function"), TEXT("functionName") });
+		const FString FunctionName = JStrAny(In, { TEXT("function"), TEXT("functionName") });
 		if (FunctionName.IsEmpty())
 		{
-			KrFail(Out, TEXT("function required (exact name of an OWN function on the class; list them with kr_dump_blueprint)"));
+			Fail(Out, TEXT("function required (exact name of an OWN function on the class; list them with kr_dump_blueprint)"));
 			return;
 		}
 
-		const int32 StatementOffset = KrJIntAny(In, { TEXT("statementOffset"), TEXT("offset") }, 0);
-		const int32 StatementLimit = KrJIntAny(In, { TEXT("statementLimit"), TEXT("limit") }, 2000);
-		const bool bIncludeRaw = KrJBool(In, TEXT("includeRaw"), true);
+		const int32 StatementOffset = JIntAny(In, { TEXT("statementOffset"), TEXT("offset") }, 0);
+		const int32 StatementLimit = JIntAny(In, { TEXT("statementLimit"), TEXT("limit") }, 2000);
+		const bool bIncludeRaw = JBool(In, TEXT("includeRaw"), true);
 		if (KrRejectPaging(Out, StatementOffset, StatementLimit, 5000, TEXT("statementOffset"), TEXT("statementLimit"))) { return; }
 
 		FGCScopeGuard GcLock;
@@ -1151,7 +1081,7 @@ namespace MifKr::BridgeEndpoints
 			if (Inherited)
 			{
 				UClass* Owner = Inherited->GetOwnerClass();
-				KrFail(Out, FString::Printf(
+				Fail(Out, FString::Printf(
 					TEXT("function '%s' is INHERITED, not own to %s - its bytecode belongs to %s; call kr_disassemble_function with asset '%s'"),
 					*FunctionName, *BPGC->GetName(),
 					Owner ? *Owner->GetName() : TEXT("its parent"),
@@ -1159,7 +1089,7 @@ namespace MifKr::BridgeEndpoints
 				return;
 			}
 			const TArray<FString> Near = KrNearMissFunctions(BPGC, FunctionName.Left(FMath::Min(5, FunctionName.Len())), 10);
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("function '%s' not found on %s (own functions only)%s - list every own function with kr_dump_blueprint"),
 				*FunctionName, *BPGC->GetName(),
 				Near.Num() > 0 ? *FString::Printf(TEXT("; nearest own names: %s"), *FString::Join(Near, TEXT(", "))) : TEXT("")));
@@ -1167,7 +1097,7 @@ namespace MifKr::BridgeEndpoints
 		}
 		if (Func->Script.Num() == 0)
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("'%s' has no bytecode (Script.Num()==0) - it is a stub, an interface shell or a BlueprintImplementableEvent declaration; there is nothing to disassemble"),
 				*FunctionName));
 			return;
@@ -1327,7 +1257,7 @@ namespace MifKr::BridgeEndpoints
 	// than wrong.
 	static void H_kr_list_events(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("asset"), TEXT("sourceAsset"), TEXT("path"), TEXT("kind"), TEXT("includeFrameParamMap") },
 			TEXT("asset (aliases: sourceAsset, path), kind, includeFrameParamMap"),
 			{{ TEXT("includeUnrecovered"),
@@ -1339,16 +1269,16 @@ namespace MifKr::BridgeEndpoints
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGCStrict(In, Out, { TEXT("asset"), TEXT("sourceAsset"), TEXT("path") }, TEXT("asset"));
 		if (!BPGC) { return; }
 
-		const FString KindArg = KrJStrAny(In, { TEXT("kind") }, TEXT("all"));
+		const FString KindArg = JStrAny(In, { TEXT("kind") }, TEXT("all"));
 		bool bAllKinds = true;
 		MifUber::EEventKind WantKind = MifUber::EEventKind::Event;
 		if (!KrParseEventKind(KindArg, bAllKinds, WantKind))
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("kind '%s' is not recognised; pass one of: all, event, bndEvt, inpActEvt, sequenceEvent"), *KindArg));
 			return;
 		}
-		const bool bIncludeFrameParamMap = KrJBool(In, TEXT("includeFrameParamMap"), true);
+		const bool bIncludeFrameParamMap = JBool(In, TEXT("includeFrameParamMap"), true);
 
 		Out->SetStringField(TEXT("class"), BPGC->GetPathName());
 		Out->SetStringField(TEXT("className"), BPGC->GetName());
@@ -1453,7 +1383,7 @@ namespace MifKr::BridgeEndpoints
 	// PKG_Cooked gate here, unlike the corpus sweep, which gates because it is enumerating.
 	static void H_kr_analyze_ubergraph(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("asset"), TEXT("sourceAsset"), TEXT("path"), TEXT("includePerEvent"), TEXT("includeOffsets") },
 			TEXT("asset (aliases: sourceAsset, path), includePerEvent, includeOffsets"),
 			{{ TEXT("pathFilter"),
@@ -1467,8 +1397,8 @@ namespace MifKr::BridgeEndpoints
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGCStrict(In, Out, { TEXT("asset"), TEXT("sourceAsset"), TEXT("path") }, TEXT("asset"));
 		if (!BPGC) { return; }
 
-		const bool bIncludePerEvent = KrJBool(In, TEXT("includePerEvent"), true);
-		const bool bIncludeOffsets = KrJBool(In, TEXT("includeOffsets"), false);
+		const bool bIncludePerEvent = JBool(In, TEXT("includePerEvent"), true);
+		const bool bIncludeOffsets = JBool(In, TEXT("includeOffsets"), false);
 
 		Out->SetStringField(TEXT("class"), BPGC->GetPathName());
 		Out->SetStringField(TEXT("className"), BPGC->GetName());
@@ -1674,7 +1604,7 @@ namespace MifKr::BridgeEndpoints
 	// (C++) classes also resolve, so this doubles as a way to read an engine class's property types.
 	static void H_kr_pin_type_from_property(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("class"), TEXT("className"), TEXT("asset"), TEXT("property"), TEXT("propertyName"), TEXT("selfScope") },
 			TEXT("class (aliases: className, asset), property (alias: propertyName), selfScope"),
 			{{ TEXT("function"),
@@ -1683,10 +1613,10 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 
-		const FString ClassArg = KrJStrAny(In, { TEXT("class"), TEXT("className"), TEXT("asset") });
+		const FString ClassArg = JStrAny(In, { TEXT("class"), TEXT("className"), TEXT("asset") });
 		if (ClassArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("class required (a _C class path such as /Game/Path/BP_Foo.BP_Foo_C, a plain asset path, or a native class path such as /Script/Engine.Actor)"));
+			Fail(Out, TEXT("class required (a _C class path such as /Game/Path/BP_Foo.BP_Foo_C, a plain asset path, or a native class path such as /Script/Engine.Actor)"));
 			return;
 		}
 
@@ -1707,17 +1637,17 @@ namespace MifKr::BridgeEndpoints
 		}
 		if (!Target)
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("class not found: '%s'. Accepted forms: a Blueprint _C class path (/Game/Path/BP_Foo.BP_Foo_C), ")
 				TEXT("a Blueprint asset path, a native class path (/Script/Engine.Actor), or an unambiguous class name. ")
 				TEXT("Blueprint resolution reported: %s"), *ClassArg, *ResolveError));
 			return;
 		}
 
-		const FString PropertyName = KrJStrAny(In, { TEXT("property"), TEXT("propertyName") });
+		const FString PropertyName = JStrAny(In, { TEXT("property"), TEXT("propertyName") });
 		if (PropertyName.IsEmpty())
 		{
-			KrFail(Out, TEXT("property required (exact property name on the class; list them with kr_dump_blueprint or MifBridge's describe_class)"));
+			Fail(Out, TEXT("property required (exact property name on the class; list them with kr_dump_blueprint or MifBridge's describe_class)"));
 			return;
 		}
 
@@ -1729,7 +1659,7 @@ namespace MifKr::BridgeEndpoints
 			{
 				if (*It && (*It)->GetName().Contains(PropertyName.Left(FMath::Min(4, PropertyName.Len())))) { Near.Add((*It)->GetName()); }
 			}
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("property '%s' not found on %s (search includes inherited properties)%s - list every property with kr_dump_blueprint, MifBridge's describe_class or list_object_properties"),
 				*PropertyName, *Target->GetName(),
 				Near.Num() > 0 ? *FString::Printf(TEXT("; nearest: %s"), *FString::Join(Near, TEXT(", "))) : TEXT("")));
@@ -1738,14 +1668,14 @@ namespace MifKr::BridgeEndpoints
 
 		// selfScope controls when the serializer collapses an object reference to the "<SELF>" token.
 		UClass* SelfScope = Target;
-		const FString SelfScopeArg = KrJStrAny(In, { TEXT("selfScope") });
+		const FString SelfScopeArg = JStrAny(In, { TEXT("selfScope") });
 		if (!SelfScopeArg.IsEmpty())
 		{
 			UClass* Scope = LoadClass<UObject>(nullptr, *SelfScopeArg, nullptr, LOAD_NoWarn | LOAD_Quiet);
 			if (!Scope) { Scope = FindFirstObject<UClass>(*SelfScopeArg, EFindFirstObjectOptions::None); }
 			if (!Scope)
 			{
-				KrFail(Out, FString::Printf(TEXT("selfScope class not found: '%s' (pass a class path, or omit it to use the resolved class)"), *SelfScopeArg));
+				Fail(Out, FString::Printf(TEXT("selfScope class not found: '%s' (pass a class path, or omit it to use the resolved class)"), *SelfScopeArg));
 				return;
 			}
 			SelfScope = Scope;
@@ -1754,7 +1684,7 @@ namespace MifKr::BridgeEndpoints
 		FEdGraphPinType PinType;
 		if (!FPropertyTypeHelper::ConvertPropertyToPinType(Property, PinType))
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("property '%s' (%s) has no Blueprint pin type - it is a C++-only property shape that Blueprint cannot represent"),
 				*PropertyName, Property->GetClass() ? *Property->GetClass()->GetName() : TEXT("?")));
 			return;
@@ -2053,7 +1983,7 @@ namespace MifKr::BridgeEndpoints
 	// is a slower duplicate. The response says so via sourceCooked in the job result.
 	static void H_kr_reconstruct_request(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path"), TEXT("mode"),
 			  TEXT("variant"), TEXT("copyVariant"), TEXT("function"), TEXT("functionName"), TEXT("func"),
 			  TEXT("targetPath"), TEXT("childPath"), TEXT("outPath") },
@@ -2075,7 +2005,7 @@ namespace MifKr::BridgeEndpoints
 		if (MifKr::Jobs::IsBusy())
 		{
 			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
-			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Fail(Out, MifKr::Jobs::BusyMessage());
 			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
 			Out->SetStringField(TEXT("runningKind"), Running.Kind);
 			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
@@ -2084,42 +2014,42 @@ namespace MifKr::BridgeEndpoints
 
 		if (!GEditor)
 		{
-			KrFail(Out, TEXT("no GEditor - kr_reconstruct_request defers its work through the editor timer manager and cannot run in a commandlet"));
+			Fail(Out, TEXT("no GEditor - kr_reconstruct_request defers its work through the editor timer manager and cannot run in a commandlet"));
 			return;
 		}
 
-		const FString SourceArg = KrJStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
+		const FString SourceArg = JStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
 		if (SourceArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
+			Fail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
 			return;
 		}
 
-		FString Mode = KrJStrAny(In, { TEXT("mode") }, TEXT("copy")).ToLower();
+		FString Mode = JStrAny(In, { TEXT("mode") }, TEXT("copy")).ToLower();
 		if (Mode != TEXT("copy") && Mode != TEXT("function"))
 		{
-			KrFail(Out, FString::Printf(TEXT("mode '%s' is not recognised; pass 'copy' (whole editable Blueprint) or 'function' (one function into a scratch Blueprint)"), *Mode));
+			Fail(Out, FString::Printf(TEXT("mode '%s' is not recognised; pass 'copy' (whole editable Blueprint) or 'function' (one function into a scratch Blueprint)"), *Mode));
 			return;
 		}
 
-		const FString VariantArg = KrJStrAny(In, { TEXT("variant"), TEXT("copyVariant") });
-		const FString FunctionArg = KrJStrAny(In, { TEXT("function"), TEXT("functionName"), TEXT("func") });
+		const FString VariantArg = JStrAny(In, { TEXT("variant"), TEXT("copyVariant") });
+		const FString FunctionArg = JStrAny(In, { TEXT("function"), TEXT("functionName"), TEXT("func") });
 
 		// Cross-parameter rules stated as errors, not silently ignored: a 'variant' quietly dropped in
 		// function mode would leave the caller believing they controlled something they did not.
 		if (Mode == TEXT("function") && !VariantArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("variant applies to mode 'copy' only - function mode always mints a scratch Blueprint parented to the cooked source class; drop variant or switch to mode 'copy'"));
+			Fail(Out, TEXT("variant applies to mode 'copy' only - function mode always mints a scratch Blueprint parented to the cooked source class; drop variant or switch to mode 'copy'"));
 			return;
 		}
 		if (Mode == TEXT("copy") && !FunctionArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("function applies to mode 'function' only - copy mode reconstructs EVERY function of the class; drop function or switch to mode 'function'"));
+			Fail(Out, TEXT("function applies to mode 'function' only - copy mode reconstructs EVERY function of the class; drop function or switch to mode 'function'"));
 			return;
 		}
 		if (Mode == TEXT("function") && FunctionArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("function required when mode='function' (exact name of an OWN function on the class; list them with kr_dump_blueprint)"));
+			Fail(Out, TEXT("function required when mode='function' (exact name of an OWN function on the class; list them with kr_dump_blueprint)"));
 			return;
 		}
 
@@ -2132,7 +2062,7 @@ namespace MifKr::BridgeEndpoints
 			else if (Variant == TEXT("sibling_full") || Variant == TEXT("full")) { bAsChild = false; bFullParent = true; }
 			else
 			{
-				KrFail(Out, FString::Printf(
+				Fail(Out, FString::Printf(
 					TEXT("variant '%s' is not recognised; pass child (IS-A the source), sibling or uncooked (parent-class copy), or sibling_full/full (sibling whose Blueprint parent chain is also reconstructed)"),
 					*Variant));
 				return;
@@ -2147,7 +2077,7 @@ namespace MifKr::BridgeEndpoints
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(SourceArg, ResolveError);
 		if (!BPGC)
 		{
-			KrFail(Out, ResolveError);
+			Fail(Out, ResolveError);
 			return;
 		}
 
@@ -2173,7 +2103,7 @@ namespace MifKr::BridgeEndpoints
 			{
 				UFunction* Inherited = BPGC->FindFunctionByName(FName(*FunctionArg), EIncludeSuperFlag::IncludeSuper);
 				const TArray<FString> Near = KrNearMissFunctions(BPGC, FunctionArg.Left(FMath::Min(5, FunctionArg.Len())), 10);
-				KrFail(Out, FString::Printf(
+				Fail(Out, FString::Printf(
 					TEXT("function '%s' not found on %s (own functions only)%s%s"),
 					*FunctionArg, *BPGC->GetName(),
 					Inherited ? TEXT(" - it is INHERITED; reconstruct it from the class that owns it") : TEXT(""),
@@ -2184,7 +2114,7 @@ namespace MifKr::BridgeEndpoints
 			{
 				// The pipeline itself refuses this by design; refusing here too means the caller gets
 				// the REASON instead of a job that "succeeded" with an empty graph.
-				KrFail(Out, FString::Printf(
+				Fail(Out, FString::Printf(
 					TEXT("'%s' is the ubergraph (FUNC_UbergraphFunction) - it is one switch-dispatched function holding EVERY event body, ")
 					TEXT("and reconstructing it whole is both wrong and the source of a deep crash. Use mode:'copy', where events are sliced ")
 					TEXT("per-event by the event delegate; inspect its structure first with kr_analyze_ubergraph."),
@@ -2193,7 +2123,7 @@ namespace MifKr::BridgeEndpoints
 			}
 			if (SourceFunc->Script.Num() == 0)
 			{
-				KrFail(Out, FString::Printf(
+				Fail(Out, FString::Printf(
 					TEXT("function '%s' has no bytecode (Script.Num()==0) - it is a stub, an interface shell or a BlueprintImplementableEvent declaration; there is nothing to reconstruct"),
 					*FunctionArg));
 				return;
@@ -2202,7 +2132,7 @@ namespace MifKr::BridgeEndpoints
 		}
 
 		// --- target path ---
-		FString TargetPath = KrJStrAny(In, { TEXT("targetPath"), TEXT("childPath"), TEXT("outPath") });
+		FString TargetPath = JStrAny(In, { TEXT("targetPath"), TEXT("childPath"), TEXT("outPath") });
 		const bool bDefaultedPath = TargetPath.IsEmpty();
 		if (bDefaultedPath)
 		{
@@ -2227,14 +2157,14 @@ namespace MifKr::BridgeEndpoints
 				}
 				if (TargetPath.IsEmpty())
 				{
-					KrFail(Out, FString::Printf(TEXT("could not find a free package name under '%s_<n>' after 1000 tries - pass targetPath explicitly"), *Base));
+					Fail(Out, FString::Printf(TEXT("could not find a free package name under '%s_<n>' after 1000 tries - pass targetPath explicitly"), *Base));
 					return;
 				}
 			}
 		}
 		else if (!FPackageName::IsValidLongPackageName(TargetPath))
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("targetPath '%s' is not a valid long package name - pass something like /Game/Mif/%s_Child (no file extension, no trailing asset name after a dot)"),
 				*TargetPath, *BaseName));
 			return;
@@ -2244,7 +2174,7 @@ namespace MifKr::BridgeEndpoints
 		FString JobId, BeginError;
 		if (!MifKr::Jobs::TryBegin(TEXT("reconstruct"), JobId, BeginError))
 		{
-			KrFail(Out, BeginError);
+			Fail(Out, BeginError);
 			return;
 		}
 
@@ -2317,7 +2247,7 @@ namespace MifKr::BridgeEndpoints
 	// COOKED CONTENT: n/a - this endpoint reads no assets at all.
 	static void H_kr_reconstruct_status(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("jobId"), TEXT("id") },
 			TEXT("jobId (alias: id)"),
 			{{ TEXT("wait"),
@@ -2328,7 +2258,7 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 
-		const FString WantId = KrJStrAny(In, { TEXT("jobId"), TEXT("id") });
+		const FString WantId = JStrAny(In, { TEXT("jobId"), TEXT("id") });
 
 		// The honesty field. Present on EVERY response, including found:false — the constraint it
 		// describes is a property of the HTTP server, not of any particular job.
@@ -3520,7 +3450,7 @@ namespace MifKr::BridgeEndpoints
 	{
 		if (!GEditor)
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("no GEditor - %s slices its work through the editor timer manager and cannot run in a commandlet"), Kind));
 			return;
 		}
@@ -3530,13 +3460,13 @@ namespace MifKr::BridgeEndpoints
 		FString EnumError;
 		if (!KrEnumerateSweepTargets(PathFilter, Targets, AnimExcluded, CorpusTotal, EnumError))
 		{
-			KrFail(Out, EnumError);
+			Fail(Out, EnumError);
 			return;
 		}
 
 		if (StartIndex > Targets.Num())
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("startIndex %d is past the end of the target set (%d cooked Blueprints match pathFilter '%s')"),
 				StartIndex, Targets.Num(), *PathFilter));
 			return;
@@ -3549,7 +3479,7 @@ namespace MifKr::BridgeEndpoints
 		FString JobId, BeginError;
 		if (!MifKr::Jobs::TryBegin(Kind, JobId, BeginError))
 		{
-			KrFail(Out, BeginError);
+			Fail(Out, BeginError);
 			return;
 		}
 
@@ -3666,7 +3596,7 @@ namespace MifKr::BridgeEndpoints
 	// is the ground-truth loop (author a BP with the bridge, reconstruct it, diff against what you built).
 	static void H_kr_verify_fidelity(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path"),
 			  TEXT("classifyIntentional"), TEXT("classify"), TEXT("allowAnim") },
 			TEXT("sourceAsset (aliases: blueprint, bpName, path), classifyIntentional (alias: classify), allowAnim"),
@@ -3687,7 +3617,7 @@ namespace MifKr::BridgeEndpoints
 		if (MifKr::Jobs::IsBusy())
 		{
 			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
-			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Fail(Out, MifKr::Jobs::BusyMessage());
 			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
 			Out->SetStringField(TEXT("runningKind"), Running.Kind);
 			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
@@ -3695,25 +3625,25 @@ namespace MifKr::BridgeEndpoints
 		}
 		if (!GEditor)
 		{
-			KrFail(Out, TEXT("no GEditor - kr_verify_fidelity defers its work through the editor timer manager and cannot run in a commandlet"));
+			Fail(Out, TEXT("no GEditor - kr_verify_fidelity defers its work through the editor timer manager and cannot run in a commandlet"));
 			return;
 		}
 
-		const FString SourceArg = KrJStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
+		const FString SourceArg = JStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
 		if (SourceArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
+			Fail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
 			return;
 		}
 
 		FString ResolveError;
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(SourceArg, ResolveError);
-		if (!BPGC) { KrFail(Out, ResolveError); return; }
+		if (!BPGC) { Fail(Out, ResolveError); return; }
 
-		const bool bAllowAnim = KrJBool(In, TEXT("allowAnim"), false);
+		const bool bAllowAnim = JBool(In, TEXT("allowAnim"), false);
 		if (KrIsAnimBlueprintClass(BPGC) && !bAllowAnim)
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("'%s' is an Animation Blueprint and reconstruction of anim graphs is NOT implemented: the engine mints an ")
 				TEXT("anim source as a PLAIN UBlueprint (only Widget Blueprints get their own class pair), so the copy has no ")
 				TEXT("AnimGraph and every fidelity number would describe that degraded copy rather than the decompiler. ")
@@ -3725,7 +3655,7 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 
-		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+		const bool bClassify = JBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
 
 		FString BaseName = BPGC->GetName();
 		BaseName.RemoveFromEnd(TEXT("_C"));
@@ -3740,7 +3670,7 @@ namespace MifKr::BridgeEndpoints
 		}
 
 		FString JobId, BeginError;
-		if (!MifKr::Jobs::TryBegin(TEXT("verify"), JobId, BeginError)) { KrFail(Out, BeginError); return; }
+		if (!MifKr::Jobs::TryBegin(TEXT("verify"), JobId, BeginError)) { Fail(Out, BeginError); return; }
 
 		{
 			MifKr::Jobs::FJobRecord& Job = MifKr::Jobs::Mutable();
@@ -3804,7 +3734,7 @@ namespace MifKr::BridgeEndpoints
 	// Bucket SELF-MANAGED (same full compile as kr_verify_fidelity).
 	static void H_kr_classify_drift(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path"),
 			  TEXT("function"), TEXT("functionName"), TEXT("func"),
 			  TEXT("classifyIntentional"), TEXT("classify"), TEXT("allowAnim") },
@@ -3823,7 +3753,7 @@ namespace MifKr::BridgeEndpoints
 		if (MifKr::Jobs::IsBusy())
 		{
 			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
-			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Fail(Out, MifKr::Jobs::BusyMessage());
 			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
 			Out->SetStringField(TEXT("runningKind"), Running.Kind);
 			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
@@ -3831,25 +3761,25 @@ namespace MifKr::BridgeEndpoints
 		}
 		if (!GEditor)
 		{
-			KrFail(Out, TEXT("no GEditor - kr_classify_drift defers its work through the editor timer manager and cannot run in a commandlet"));
+			Fail(Out, TEXT("no GEditor - kr_classify_drift defers its work through the editor timer manager and cannot run in a commandlet"));
 			return;
 		}
 
-		const FString SourceArg = KrJStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
+		const FString SourceArg = JStrAny(In, { TEXT("sourceAsset"), TEXT("blueprint"), TEXT("bpName"), TEXT("path") });
 		if (SourceArg.IsEmpty())
 		{
-			KrFail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
+			Fail(Out, TEXT("sourceAsset required (the cooked Blueprint: its .<Name>_C class path, its asset path, or its exact name)"));
 			return;
 		}
 
 		FString ResolveError;
 		UBlueprintGeneratedClass* BPGC = KrResolveBPGC(SourceArg, ResolveError);
-		if (!BPGC) { KrFail(Out, ResolveError); return; }
+		if (!BPGC) { Fail(Out, ResolveError); return; }
 
-		const bool bAllowAnim = KrJBool(In, TEXT("allowAnim"), false);
+		const bool bAllowAnim = JBool(In, TEXT("allowAnim"), false);
 		if (KrIsAnimBlueprintClass(BPGC) && !bAllowAnim)
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("'%s' is an Animation Blueprint: the engine mints an anim source as a PLAIN UBlueprint, so the copy has ")
 				TEXT("no AnimGraph and per-function verdicts would describe a degraded copy, not the decompiler. ")
 				TEXT("Pass allowAnim:true to classify it anyway - the result is then flagged degraded:true."),
@@ -3859,8 +3789,8 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 
-		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
-		const FString FunctionFilter = KrJStrAny(In, { TEXT("function"), TEXT("functionName"), TEXT("func") });
+		const bool bClassify = JBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+		const FString FunctionFilter = JStrAny(In, { TEXT("function"), TEXT("functionName"), TEXT("func") });
 
 		FString BaseName = BPGC->GetName();
 		BaseName.RemoveFromEnd(TEXT("_C"));
@@ -3875,7 +3805,7 @@ namespace MifKr::BridgeEndpoints
 		}
 
 		FString JobId, BeginError;
-		if (!MifKr::Jobs::TryBegin(TEXT("classify"), JobId, BeginError)) { KrFail(Out, BeginError); return; }
+		if (!MifKr::Jobs::TryBegin(TEXT("classify"), JobId, BeginError)) { Fail(Out, BeginError); return; }
 
 		{
 			MifKr::Jobs::FJobRecord& Job = MifKr::Jobs::Mutable();
@@ -3945,7 +3875,7 @@ namespace MifKr::BridgeEndpoints
 	// Bucket SELF-MANAGED: it compiles one throwaway Blueprint per slice.
 	static void H_kr_drift_census(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("pathFilter"), TEXT("filter"), TEXT("pathSubstr"), TEXT("startIndex"), TEXT("start"),
 			  TEXT("maxCount"), TEXT("limit"), TEXT("classifyIntentional"), TEXT("classify") },
 			TEXT("pathFilter (aliases: filter, pathSubstr), startIndex (alias: start), maxCount (alias: limit), ")
@@ -3965,26 +3895,26 @@ namespace MifKr::BridgeEndpoints
 		if (MifKr::Jobs::IsBusy())
 		{
 			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
-			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Fail(Out, MifKr::Jobs::BusyMessage());
 			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
 			Out->SetStringField(TEXT("runningKind"), Running.Kind);
 			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
 			return;
 		}
 
-		const FString PathFilter = KrJStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathSubstr") }, TEXT("/Game/"));
-		const int32 StartIndex = KrJIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
-		const int32 MaxCount = KrJIntAny(In, { TEXT("maxCount"), TEXT("limit") }, 50);
-		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+		const FString PathFilter = JStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathSubstr") }, TEXT("/Game/"));
+		const int32 StartIndex = JIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
+		const int32 MaxCount = JIntAny(In, { TEXT("maxCount"), TEXT("limit") }, 50);
+		const bool bClassify = JBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
 
 		if (StartIndex < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
+			Fail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
 			return;
 		}
 		if (MaxCount < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("maxCount %d is invalid; pass a positive count, or 0 for the whole filtered corpus"), MaxCount));
+			Fail(Out, FString::Printf(TEXT("maxCount %d is invalid; pass a positive count, or 0 for the whole filtered corpus"), MaxCount));
 			return;
 		}
 
@@ -4010,7 +3940,7 @@ namespace MifKr::BridgeEndpoints
 	// COOKED: the target set IS the cooked corpus - the same exact-class-path gate that drives F3.
 	static void H_kr_batch_reconstruct(const TSharedRef<FJsonObject>& In, const TSharedRef<FJsonObject>& Out)
 	{
-		if (KrRejectUnknownParams(In, Out,
+		if (RejectUnknownParams(In, Out,
 			{ TEXT("pathFilter"), TEXT("filter"), TEXT("pathContains"), TEXT("mode"), TEXT("variant"),
 			  TEXT("verify"), TEXT("startIndex"), TEXT("start"), TEXT("maxBlueprints"), TEXT("limit"),
 			  TEXT("classifyIntentional"), TEXT("classify") },
@@ -4029,26 +3959,26 @@ namespace MifKr::BridgeEndpoints
 		if (MifKr::Jobs::IsBusy())
 		{
 			const MifKr::Jobs::FJobRecord& Running = MifKr::Jobs::Get();
-			KrFail(Out, MifKr::Jobs::BusyMessage());
+			Fail(Out, MifKr::Jobs::BusyMessage());
 			Out->SetStringField(TEXT("runningJobId"), Running.JobId);
 			Out->SetStringField(TEXT("runningKind"), Running.Kind);
 			Out->SetStringField(TEXT("runningState"), MifKr::Jobs::StateName(Running.State));
 			return;
 		}
 
-		const FString PathFilter = KrJStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathContains") }, TEXT("/Game/"));
-		const FString ModeArg = KrJStrAny(In, { TEXT("mode"), TEXT("variant") }, TEXT("sibling")).ToLower();
-		const bool bVerify = KrJBool(In, TEXT("verify"), false);
-		const int32 StartIndex = KrJIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
-		const int32 MaxBlueprints = KrJIntAny(In, { TEXT("maxBlueprints"), TEXT("limit") }, 0);
-		const bool bClassify = KrJBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
+		const FString PathFilter = JStrAny(In, { TEXT("pathFilter"), TEXT("filter"), TEXT("pathContains") }, TEXT("/Game/"));
+		const FString ModeArg = JStrAny(In, { TEXT("mode"), TEXT("variant") }, TEXT("sibling")).ToLower();
+		const bool bVerify = JBool(In, TEXT("verify"), false);
+		const int32 StartIndex = JIntAny(In, { TEXT("startIndex"), TEXT("start") }, 0);
+		const int32 MaxBlueprints = JIntAny(In, { TEXT("maxBlueprints"), TEXT("limit") }, 0);
+		const bool bClassify = JBoolAny(In, { TEXT("classifyIntentional"), TEXT("classify") }, true);
 
 		bool bAsChild = false;
 		if (ModeArg == TEXT("child"))                                        { bAsChild = true; }
 		else if (ModeArg == TEXT("sibling") || ModeArg == TEXT("uncooked"))  { bAsChild = false; }
 		else
 		{
-			KrFail(Out, FString::Printf(
+			Fail(Out, FString::Printf(
 				TEXT("mode '%s' is not recognised; pass 'sibling' (parent-class copy, the default and what the console sweep does) ")
 				TEXT("or 'child' (IS-A the cooked class, the only mode fidelity is measurable in)"), *ModeArg));
 			return;
@@ -4059,19 +3989,19 @@ namespace MifKr::BridgeEndpoints
 			// The engine harness refuses the same combination for the same reason, and refusing loudly is
 			// the whole point: a sibling sweep with verify on would emit systematic FALSE drift on every
 			// Blueprint and look like a decompiler regression.
-			KrFail(Out, TEXT("verify requires mode:'child' - a SIBLING copy mints its components into the transient package, so ")
+			Fail(Out, TEXT("verify requires mode:'child' - a SIBLING copy mints its components into the transient package, so ")
 				TEXT("every component reference differs by object path and the drift would be an artefact of the mode, not of the ")
 				TEXT("decompiler. Re-run with mode:'child', or drop verify for a pass/fail-only sweep."));
 			return;
 		}
 		if (StartIndex < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
+			Fail(Out, FString::Printf(TEXT("startIndex %d is invalid; pass 0 or greater (it is the crash-resume cursor)"), StartIndex));
 			return;
 		}
 		if (MaxBlueprints < 0)
 		{
-			KrFail(Out, FString::Printf(TEXT("maxBlueprints %d is invalid; pass a positive count, or 0 for every match"), MaxBlueprints));
+			Fail(Out, FString::Printf(TEXT("maxBlueprints %d is invalid; pass a positive count, or 0 for every match"), MaxBlueprints));
 			return;
 		}
 
