@@ -1877,6 +1877,39 @@ namespace MifKr::BridgeEndpoints
 			Result->SetNumberField(TEXT("graphNodes"), Job.NodesCreated);
 			if (NewBP->GeneratedClass) { Result->SetStringField(TEXT("class"), NewBP->GeneratedClass->GetPathName()); }
 			Result->SetBoolField(TEXT("saved"), true);
+
+			// WHAT WAS RECONSTRUCTED, AND WHAT ONLY PARTLY WAS. These tallies are fed by the
+			// delegates the engine actually invoked and have always been recorded on the job; they
+			// were simply never put on the wire, so a caller saw saved:true and a node count while
+			// "body reconstructed PARTIALLY - do not trust it as complete" went to the UE log alone.
+			// An agent driving this over HTTP never sees that log. Reported as MifBridge #3.
+			//
+			// The decompiler's own comment is the reason this matters more than it looks:
+			// "a PARTIAL body that looks complete is the most dangerous output this tool can
+			// produce" (MifReconstructEvent.cpp).
+			Result->SetNumberField(TEXT("functionsDone"), Job.FunctionsDone);
+			Result->SetNumberField(TEXT("functionsReconstructed"), Job.FunctionsReconstructed);
+			Result->SetNumberField(TEXT("functionsDegraded"), Job.FunctionsDegraded);
+			Result->SetNumberField(TEXT("eventsDone"), Job.EventsDone);
+			Result->SetNumberField(TEXT("eventsReconstructed"), Job.EventsReconstructed);
+
+			const int32 EventsDegraded = FMath::Max(0, Job.EventsDone - Job.EventsReconstructed);
+			const bool bPartial = (Job.FunctionsDegraded > 0) || (EventsDegraded > 0);
+			Result->SetBoolField(TEXT("degraded"), bPartial);
+			if (bPartial)
+			{
+				// SAVED AND PARTIAL AT ONCE, which is the combination the report was about. Saying
+				// both in one sentence is the point: the asset on disk is real, and it is not a
+				// faithful copy of the source.
+				Result->SetStringField(TEXT("degradedNote"), FString::Printf(
+					TEXT("%d function(s) and %d event(s) reconstructed only PARTIALLY - some statements ")
+					TEXT("were degraded and the bodies are NOT complete. The asset was still SAVED, ")
+					TEXT("because copy mode's save happens inside the engine's own export call. Treat ")
+					TEXT("this asset as a partial decompilation: inspect the degraded graphs before ")
+					TEXT("relying on them, and do not use it as a source for a further job."),
+					Job.FunctionsDegraded, EventsDegraded));
+			}
+
 			Result->SetStringField(TEXT("resultNote"),
 				TEXT("copy mode SAVES the asset (the engine export does), and compiles it internally - so compile.measured is ")
 				TEXT("false here: this endpoint does not own that FCompilerResultsLog and will not invent errors:0 for it. ")
@@ -1905,6 +1938,54 @@ namespace MifKr::BridgeEndpoints
 			return;
 		}
 		const FString ShortName = FPackageName::GetShortName(Plan.TargetPath);
+
+		// AN OCCUPIED TARGET KILLS THE EDITOR, so it is refused here rather than discovered inside
+		// the engine. FKismetEditorUtilities::CreateBlueprint opens with
+		//     check(FindObject<UBlueprint>(Outer, *NewBPName.ToString()) == NULL);   Kismet2.cpp:432
+		// a HARD check, fatal wherever checks are compiled in - and CreatePackage above does not
+		// fail on an existing path, it returns the package that is already there. So a second job
+		// aimed at a targetPath a previous job created walked straight into it and took the whole
+		// editor down, along with every unrelated unsaved change. Reported as MifBridge #3, where
+		// a copy job wrote /Game/Mif/InventorySpecialSlotWidget_Child and a function job was then
+		// pointed at the same path.
+		//
+		// The `if (!NewBP)` check below cannot catch this: the process is gone before CreateBlueprint
+		// returns. A null return means something else entirely, and both are worth keeping.
+		//
+		// NOT REUSED, though the report offered that as an acceptable alternative. Whatever is
+		// already at that path was minted by a different job with its own parent class - a copy
+		// job's child, in the reported case - and writing a _Recon graph into somebody else's asset
+		// is how a corrupted target still reports success.
+		if (UBlueprint* Occupant = FindObject<UBlueprint>(Package, *ShortName))
+		{
+			Finish(false, FString::Printf(
+				TEXT("targetPath '%s' already holds a Blueprint ('%s', parent '%s') and function mode ")
+				TEXT("mints a NEW asset - creating over it is a fatal engine assertion ")
+				TEXT("(Kismet2.cpp check on FindObject<UBlueprint>), which terminates the editor and ")
+				TEXT("loses all unsaved work. NOTHING was created. Use a targetPath nothing occupies, ")
+				TEXT("or delete/rename the existing asset first."),
+				*Plan.TargetPath, *Occupant->GetName(),
+				Occupant->ParentClass ? *Occupant->ParentClass->GetName() : TEXT("?")));
+			return;
+		}
+
+		// THE SLOWER FUSE, and it is not the reported crash. An asset that exists ON DISK but is not
+		// loaded passes the check above, so CreateBlueprint succeeds and this new in-memory package
+		// shadows the file. Nothing breaks yet - function mode never saves - but this endpoint's own
+		// result note tells the caller to persist with save_dirty_packages, and that would overwrite
+		// the asset on disk with a package built for a different purpose. Refused for the same reason
+		// and named differently, so the two are told apart in the log rather than guessed at.
+		if (FPackageName::DoesPackageExist(Plan.TargetPath))
+		{
+			Finish(false, FString::Printf(
+				TEXT("targetPath '%s' already exists on disk (it is simply not loaded right now). ")
+				TEXT("Minting over it would leave an in-memory package shadowing the file, and this ")
+				TEXT("endpoint asks you to persist with save_dirty_packages - which would overwrite ")
+				TEXT("it. NOTHING was created. Use a targetPath nothing occupies."),
+				*Plan.TargetPath));
+			return;
+		}
+
 		// Parented to the COOKED source class so member references resolve during decompilation.
 		UBlueprint* NewBP = FKismetEditorUtilities::CreateBlueprint(
 			BPGC, Package, FName(*ShortName), BPTYPE_Normal,
