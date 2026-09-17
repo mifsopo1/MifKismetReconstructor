@@ -392,6 +392,43 @@ namespace MifKr::BridgeEndpoints
 		return N;
 	}
 
+	/** True when P is a property shape that names another UObject/UClass by raw pointer
+	 *  (Object/WeakObject/LazyObject/SoftObject/Class/SoftClass/Interface) AND that pointer is null.
+	 *  On a Blueprint whose full dependency closure isn't loaded - e.g. an asset pulled from a mod pak
+	 *  with retoc and copied in isolation from the classes its own properties reference - the import
+	 *  never resolves and the pointer comes back null. FProperty::GetCPPType() does not tolerate that
+	 *  for these types; it asserts on the null class and crashes the whole editor. Callers MUST check
+	 *  this before calling GetCPPType() on a property that was not already type-switched by hand. */
+	static bool KrPropertyTypeUnresolved(const FProperty* P)
+	{
+		if (!P) { return false; }
+		if (const FObjectPropertyBase* ObjProp = CastField<const FObjectPropertyBase>(P))
+		{
+			return ObjProp->PropertyClass == nullptr;
+		}
+		if (const FClassProperty* ClassProp = CastField<const FClassProperty>(P))
+		{
+			return ClassProp->MetaClass == nullptr;
+		}
+		if (const FSoftClassProperty* SoftClassProp = CastField<const FSoftClassProperty>(P))
+		{
+			return SoftClassProp->MetaClass == nullptr;
+		}
+		if (const FInterfaceProperty* IfaceProp = CastField<const FInterfaceProperty>(P))
+		{
+			return IfaceProp->InterfaceClass == nullptr;
+		}
+		return false;
+	}
+
+	/** Safe substitute for P->GetCPPType() at every kr_* JSON boundary: same string on a resolved
+	 *  property, "<unresolved>" instead of an editor crash on one whose referenced class didn't load. */
+	static FString KrSafeCPPType(const FProperty* P)
+	{
+		if (!P) { return TEXT("?"); }
+		return KrPropertyTypeUnresolved(P) ? TEXT("<unresolved>") : P->GetCPPType();
+	}
+
 	/** Reduce a disassembled statement to {Inst, StatementIndex} for cheap CFG views (includeRaw:false).
 	 *  StatementIndex is a BYTE OFFSET into Script, not an ordinal — pagination is by ARRAY index. */
 	static TSharedPtr<FJsonValue> KrThinStatement(const TSharedPtr<FJsonValue>& Value)
@@ -911,7 +948,15 @@ namespace MifKr::BridgeEndpoints
 				if (PropRows.Num() >= 500) { bPropertiesTruncated = true; continue; }
 				TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
 				Row->SetStringField(TEXT("name"), P->GetName());
-				Row->SetStringField(TEXT("cppType"), P->GetCPPType());
+				Row->SetStringField(TEXT("cppType"), KrSafeCPPType(P));
+				if (KrPropertyTypeUnresolved(P))
+				{
+					Row->SetBoolField(TEXT("typeUnresolved"), true);
+					Row->SetStringField(TEXT("typeUnresolvedNote"),
+						TEXT("this property's referenced class/interface did not resolve - GetCPPType() ")
+						TEXT("was skipped because it asserts on a null PropertyClass/MetaClass/InterfaceClass. ")
+						TEXT("Likely cause: this Blueprint's full dependency closure isn't loaded."));
+				}
 				Row->SetStringField(TEXT("propertyClass"), P->GetClass() ? P->GetClass()->GetName() : TEXT("?"));
 				Row->SetArrayField(TEXT("flags"), KrPropertyFlagNames(P->GetPropertyFlags()));
 				PropRows.Add(MakeShared<FJsonValueObject>(Row));
@@ -1697,7 +1742,15 @@ namespace MifKr::BridgeEndpoints
 		Out->SetBoolField(TEXT("cooked"), KrIsCooked(Target));
 		Out->SetStringField(TEXT("property"), Property->GetName());
 		Out->SetStringField(TEXT("propertyClass"), Property->GetClass() ? Property->GetClass()->GetName() : TEXT("?"));
-		Out->SetStringField(TEXT("cppType"), Property->GetCPPType());
+		Out->SetStringField(TEXT("cppType"), KrSafeCPPType(Property));
+		if (KrPropertyTypeUnresolved(Property))
+		{
+			Out->SetBoolField(TEXT("typeUnresolved"), true);
+			Out->SetStringField(TEXT("typeUnresolvedNote"),
+				TEXT("this property's referenced class/interface did not resolve - GetCPPType() was ")
+				TEXT("skipped because it asserts on a null PropertyClass/MetaClass/InterfaceClass. Likely ")
+				TEXT("cause: this Blueprint's full dependency closure isn't loaded."));
+		}
 		Out->SetArrayField(TEXT("propertyFlags"), KrPropertyFlagNames(Property->GetPropertyFlags()));
 		Out->SetObjectField(TEXT("pinType"), FPropertyTypeHelper::SerializeGraphPinType(PinType, SelfScope));
 		Out->SetStringField(TEXT("selfScope"), SelfScope->GetPathName());
