@@ -402,10 +402,17 @@ namespace MifKr::BridgeEndpoints
 	static bool KrPropertyTypeUnresolved(const FProperty* P)
 	{
 		if (!P) { return false; }
-		if (const FObjectPropertyBase* ObjProp = CastField<const FObjectPropertyBase>(P))
-		{
-			return ObjProp->PropertyClass == nullptr;
-		}
+
+		// ORDER MATTERS, AND MOST-DERIVED MUST COME FIRST. FClassProperty derives from FObjectProperty and
+		// FSoftClassProperty from FSoftObjectProperty, so both ARE FObjectPropertyBase: testing that base first
+		// catches them and answers about the wrong pointer. Read out of UE 5.8 rather than reasoned about:
+		//   FObjectProperty::GetCPPType      check(PropertyClass)   Private/UObject/PropertyObject.cpp:42
+		//   FClassProperty::GetCPPType       check(MetaClass)       Private/UObject/PropertyClass.cpp:148
+		//   FSoftClassProperty::GetCPPType   check(MetaClass)       Private/UObject/PropertySoftClassPtr.cpp:45
+		//   hierarchy                                               Public/UObject/UnrealType.h:3465, 3550, 3631
+		// PropertyClass and MetaClass are separate fields. On a class-pointer property whose MetaClass import
+		// failed, PropertyClass is still the valid UClass, so a base-first test reports "resolved" and the
+		// assert fires anyway - the exact crash this guard exists to stop.
 		if (const FClassProperty* ClassProp = CastField<const FClassProperty>(P))
 		{
 			return ClassProp->MetaClass == nullptr;
@@ -414,9 +421,15 @@ namespace MifKr::BridgeEndpoints
 		{
 			return SoftClassProp->MetaClass == nullptr;
 		}
+		// FInterfaceProperty is NOT an FObjectPropertyBase (it derives from TProperty<FScriptInterface,
+		// FProperty>), so its position is not load-bearing - it is kept beside the others for one rule to read.
 		if (const FInterfaceProperty* IfaceProp = CastField<const FInterfaceProperty>(P))
 		{
 			return IfaceProp->InterfaceClass == nullptr;
+		}
+		if (const FObjectPropertyBase* ObjProp = CastField<const FObjectPropertyBase>(P))
+		{
+			return ObjProp->PropertyClass == nullptr;
 		}
 		return false;
 	}
